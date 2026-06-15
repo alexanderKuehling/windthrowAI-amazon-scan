@@ -72,7 +72,7 @@ def main():
             done_ids = {row["tile_id"] for row in csv.DictReader(f)}
         print(f"[job {args.job_idx}] Resuming – {len(done_ids)} tiles already done")
 
-    csv_file = open(done_csv, "a", newline="")
+    csv_file = open(done_csv, "a", newline="\n")
     writer   = csv.writer(csv_file)
     if not done_ids:
         writer.writerow(["tile_id", "lon_min", "lat_min", "lon_max", "lat_max",
