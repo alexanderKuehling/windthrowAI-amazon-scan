@@ -1,0 +1,10 @@
+outputs/
+tile_grid.parquet
+slurm_logs/
+models/*.pth
+gee-windthrowai-secret.json
+__pycache__/
+*.pyc
+.DS_Store
+*.egg-info/
+.venv/
