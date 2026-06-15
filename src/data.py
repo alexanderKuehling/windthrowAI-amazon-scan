@@ -142,8 +142,7 @@ def download_tile(
         url  = img.getDownloadURL({
             "bands":      GEE_L8_BANDS + ["NBR"],
             "region":     region,
-            "scale":      scale,
-            "dimensions": f"{tile_size}x{tile_size}", 
+            "dimensions": f"{tile_size}x{tile_size}",
             "format":     "NPY",
         })
         resp = requests.get(url, timeout=180)
