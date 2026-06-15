@@ -4,7 +4,7 @@ from typing import List, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 from torch.amp import autocast
 
 from .config import (
@@ -12,40 +12,38 @@ from .config import (
     CLASSIFIER_THRESHOLD,
     SEGMENTER_THRESHOLD,
 )
-from .models import WindthrowClassifier, WindthrowSegmenter
 
 
 @torch.no_grad()
 def classify_batch(
-    tensors:    torch.Tensor,           # (B, 7, H, W) normalised, on device
-    classifier: WindthrowClassifier,
+    tensors:    torch.Tensor,       # (B, 7, H, W) normalised, on device
+    classifier: nn.Module,
     threshold:  float = CLASSIFIER_THRESHOLD,
-    device:     torch.device = torch.device("cuda"),
 ) -> np.ndarray:
     """Return bool array (B,) – True = classifier predicts windthrow."""
     with autocast(device_type="cuda", dtype=torch.float16):
-        logits = classifier(tensors)    # (B,)
+        logits = classifier(tensors)    # (B,)  – DataParallel gathers on cuda:0
     probs = torch.sigmoid(logits.float()).cpu().numpy()
     return probs >= threshold
 
 
 @torch.no_grad()
 def segment_batch(
-    tensors:   torch.Tensor,            # (B, 7, H, W) normalised, on device
-    segmenter: WindthrowSegmenter,
+    tensors:   torch.Tensor,        # (B, 7, H, W) normalised, on device
+    segmenter: nn.Module,
     threshold: float = SEGMENTER_THRESHOLD,
 ) -> np.ndarray:
     """Return uint8 array (B, H, W) – binary segmentation masks."""
     with autocast(device_type="cuda", dtype=torch.float16):
-        logits = segmenter(tensors)     # (B, 1, H, W)
-    probs = torch.sigmoid(logits.float()).squeeze(1).cpu().numpy()  # (B, H, W)
+        logits = segmenter(tensors)     # (B, 1, H, W) – gathered on cuda:0
+    probs = torch.sigmoid(logits.float()).squeeze(1).cpu().numpy()
     return (probs >= threshold).astype(np.uint8)
 
 
 def run_pipeline(
-    tile_arrays: List[np.ndarray],      # each: float32 (7, H, W), raw (not normalised)
-    classifier:  WindthrowClassifier,
-    segmenter:   WindthrowSegmenter,
+    tile_arrays: List[np.ndarray],  # each: float32 (7, H, W), normalised
+    classifier:  nn.Module,
+    segmenter:   nn.Module,
     device:      torch.device = torch.device("cuda"),
     batch_size:  int = BATCH_SIZE,
 ) -> Tuple[List[bool], List[np.ndarray]]:

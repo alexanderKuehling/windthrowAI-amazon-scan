@@ -89,32 +89,40 @@ def _unwrap_state_dict(checkpoint: dict) -> dict:
     return state
 
 
+def _maybe_data_parallel(model: nn.Module, device: torch.device) -> nn.Module:
+    """Wrap with DataParallel when >1 CUDA device is visible."""
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()}× GPUs via DataParallel")
+        return nn.DataParallel(model)
+    return model
+
+
 def load_classifier(
     path:          Path         = CLASSIFIER_PTH,
     device:        torch.device = torch.device("cuda"),
     compile_model: bool         = True,
-) -> WindthrowClassifier:
+) -> nn.Module:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    # Honour backbone/dropout stored in checkpoint if present
     backbone = checkpoint.get("backbone", CLASSIFIER_BACKBONE) if isinstance(checkpoint, dict) else CLASSIFIER_BACKBONE
     dropout  = checkpoint.get("dropout",  CLASSIFIER_DROPOUT)  if isinstance(checkpoint, dict) else CLASSIFIER_DROPOUT
     model    = WindthrowClassifier(backbone_name=backbone, dropout=dropout)
     model.load_state_dict(_unwrap_state_dict(checkpoint) if isinstance(checkpoint, dict) else checkpoint)
     model.to(device).eval()
+    # compile before DataParallel – compiled graph is replicated per GPU
     if compile_model:
         model = torch.compile(model, mode="reduce-overhead")
-    return model
+    return _maybe_data_parallel(model, device)
 
 
 def load_segmenter(
     path:          Path         = SEGMENTER_PTH,
     device:        torch.device = torch.device("cuda"),
     compile_model: bool         = True,
-) -> WindthrowSegmenter:
+) -> nn.Module:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     model      = WindthrowSegmenter()
     model.load_state_dict(_unwrap_state_dict(checkpoint) if isinstance(checkpoint, dict) else checkpoint)
     model.to(device).eval()
     if compile_model:
         model = torch.compile(model, mode="reduce-overhead")
-    return model
+    return _maybe_data_parallel(model, device)
