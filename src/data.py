@@ -89,8 +89,9 @@ def _build_composite(
     max_cloud: int = CLOUD_COVER_MAX,
 ) -> Optional[ee.Image]:
     """
-    Least-cloudy Landsat-8 mosaic for *bbox*.
-    Sort ascending by cloud cover so mosaic() picks the clearest valid pixel.
+    Median Landsat-8 composite for *bbox*.
+    median() composites out residual clouds across all available scenes,
+    which is more robust than mosaic() for the cloud-heavy Amazon.
     Returns None if no scenes are available.
     """
     region = ee.Geometry.Rectangle(list(bbox))
@@ -100,11 +101,10 @@ def _build_composite(
         .filterDate(date_from, date_to)
         .filter(ee.Filter.lt("CLOUD_COVER", max_cloud))
         .select(GEE_L8_BANDS)
-        .sort("CLOUD_COVER")   # ascending → least-cloudy on top
     )
     if col.size().getInfo() == 0:
         return None
-    return col.mosaic().clip(region)
+    return col.median().clip(region)
 
 
 def _add_nbr(image: ee.Image) -> ee.Image:

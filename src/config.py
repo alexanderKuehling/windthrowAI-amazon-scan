@@ -19,7 +19,7 @@ OVERLAP_PX      = 64
 # ── Scene search ──────────────────────────────────────────────────────────
 DATE_FROM       = "2024-06-01"
 DATE_TO         = "2024-09-30"   # Amazon dry season → lowest cloud cover
-CLOUD_COVER_MAX = 30
+CLOUD_COVER_MAX = 70
 
 # ── Normalization – fixed values from the training dataset ─────────────────
 # Source: best_params_classify_optimized.json  (windthrowAI-classification-gradio)
