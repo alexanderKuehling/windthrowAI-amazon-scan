@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p cpu
+#SBATCH -p gpu
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
