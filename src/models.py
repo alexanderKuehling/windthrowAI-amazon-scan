@@ -120,8 +120,15 @@ def load_segmenter(
     compile_model: bool         = True,
 ) -> nn.Module:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    model      = WindthrowSegmenter()
-    model.load_state_dict(_unwrap_state_dict(checkpoint) if isinstance(checkpoint, dict) else checkpoint)
+    raw_state  = _unwrap_state_dict(checkpoint) if isinstance(checkpoint, dict) else checkpoint
+
+    # Checkpoint was saved directly from smp.Unet (no WindthrowSegmenter wrapper),
+    # so keys have no "unet." prefix – add it to match our module structure.
+    if not any(k.startswith("unet.") for k in raw_state):
+        raw_state = {"unet." + k: v for k, v in raw_state.items()}
+
+    model = WindthrowSegmenter()
+    model.load_state_dict(raw_state)
     model.to(device).eval()
     if compile_model:
         model = torch.compile(model, mode="reduce-overhead")

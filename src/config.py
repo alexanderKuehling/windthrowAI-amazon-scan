@@ -34,7 +34,7 @@ CLASSIFIER_BACKBONE  = "mobilenetv3_small_100"
 CLASSIFIER_DROPOUT   = 0.2
 CLASSIFIER_THRESHOLD = 0.5
 
-SEGMENTER_BACKBONE  = "resnet34"
+SEGMENTER_BACKBONE  = "vgg19_bn"
 SEGMENTER_THRESHOLD = 0.5
 
 # ── Paths ─────────────────────────────────────────────────────────────────
