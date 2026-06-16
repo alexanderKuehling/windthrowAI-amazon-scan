@@ -89,9 +89,8 @@ def _build_composite(
     max_cloud: int = CLOUD_COVER_MAX,
 ) -> Optional[ee.Image]:
     """
-    Median Landsat-8 composite for *bbox*.
-    median() composites out residual clouds across all available scenes,
-    which is more robust than mosaic() for the cloud-heavy Amazon.
+    Least-cloudy Landsat-8 mosaic for *bbox*.
+    Sorted ascending by cloud cover so mosaic() picks the clearest valid pixel.
     Returns None if no scenes are available.
     """
     region = ee.Geometry.Rectangle(list(bbox))
@@ -101,10 +100,11 @@ def _build_composite(
         .filterDate(date_from, date_to)
         .filter(ee.Filter.lt("CLOUD_COVER", max_cloud))
         .select(GEE_L8_BANDS)
+        .sort("CLOUD_COVER")
     )
     if col.size().getInfo() == 0:
         return None
-    return col.median().clip(region)
+    return col.mosaic().clip(region)
 
 
 def _add_nbr(image: ee.Image) -> ee.Image:
@@ -140,10 +140,10 @@ def download_tile(
 
     try:
         url  = img.getDownloadURL({
-            "bands":      GEE_L8_BANDS + ["NBR"],
-            "region":     region,
-            "dimensions": f"{tile_size}x{tile_size}",
-            "format":     "NPY",
+            "bands":  GEE_L8_BANDS + ["NBR"],
+            "region": region,
+            "scale":  scale,
+            "format": "NPY",
         })
         resp = requests.get(url, timeout=180)
         resp.raise_for_status()

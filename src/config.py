@@ -12,9 +12,9 @@ BAND_NAMES      = ["Red", "Green", "Blue", "nIR", "swIR1", "swIR2", "NBR"]
 NUM_MODEL_BANDS = 7   # 6 spectral + NBR computed on-the-fly
 
 # ── Tiling ────────────────────────────────────────────────────────────────
-TILE_SIZE_PX    = 1024
+TILE_SIZE_PX    = 256
 RESOLUTION_M    = 30      # Landsat-8 native resolution
-OVERLAP_PX      = 64
+OVERLAP_PX      = 32
 
 # ── Scene search ──────────────────────────────────────────────────────────
 DATE_FROM       = "2024-06-01"
@@ -49,7 +49,7 @@ SEGMENTER_PTH  = MODELS_DIR / "segmenter.pth"
 
 # ── Inference ─────────────────────────────────────────────────────────────
 BATCH_SIZE    = 64
-TILES_PER_JOB = 500
+TILES_PER_JOB = 2000
 
 # ── GEE ───────────────────────────────────────────────────────────────────
 GEE_PROJECT = "gee-windthrowai"
