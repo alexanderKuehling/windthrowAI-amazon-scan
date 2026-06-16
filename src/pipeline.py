@@ -63,7 +63,7 @@ def run_pipeline(
     for start in range(0, n, batch_size):
         batch_np = np.stack(tile_arrays[start : start + batch_size], axis=0)
         batch_t  = torch.from_numpy(batch_np).to(device, non_blocking=True)
-        preds    = classify_batch(batch_t, classifier, device=device)
+        preds    = classify_batch(batch_t, classifier)
         for i, pos in enumerate(preds):
             is_positive[start + i] = bool(pos)
 
