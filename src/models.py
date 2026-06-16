@@ -81,11 +81,13 @@ def _unwrap_state_dict(checkpoint: dict) -> dict:
     Accept both formats:
       • new format: {"state_dict": {...}, "p5": ..., ...}  (training + gradio export)
       • legacy format: raw OrderedDict of weights
-    Also strips _orig_mod. prefix left by torch.compile.
+    Strips _orig_mod. (torch.compile) and module. (DataParallel) prefixes.
     """
     state = checkpoint.get("state_dict", checkpoint)
     if any(k.startswith("_orig_mod.") for k in state):
         state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+    if any(k.startswith("module.") for k in state):
+        state = {k[len("module."):]: v for k, v in state.items()}
     return state
 
 
@@ -108,10 +110,10 @@ def load_classifier(
     model    = WindthrowClassifier(backbone_name=backbone, dropout=dropout)
     model.load_state_dict(_unwrap_state_dict(checkpoint) if isinstance(checkpoint, dict) else checkpoint)
     model.to(device).eval()
-    # compile before DataParallel – compiled graph is replicated per GPU
+    model = _maybe_data_parallel(model, device)
     if compile_model:
         model = torch.compile(model, mode="reduce-overhead")
-    return _maybe_data_parallel(model, device)
+    return model
 
 
 def load_segmenter(
@@ -130,6 +132,7 @@ def load_segmenter(
     model = WindthrowSegmenter()
     model.load_state_dict(raw_state)
     model.to(device).eval()
+    model = _maybe_data_parallel(model, device)
     if compile_model:
         model = torch.compile(model, mode="reduce-overhead")
-    return _maybe_data_parallel(model, device)
+    return model
