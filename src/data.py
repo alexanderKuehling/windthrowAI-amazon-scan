@@ -104,14 +104,14 @@ def _build_composite(
     )
     if col.size().getInfo() == 0:
         return None
-    return col.mosaic().clip(region)
+    mosaic = col.mosaic().clip(region)
+    return mosaic.multiply(0.0000275).add(-0.2)
 
 
 def _add_nbr(image: ee.Image) -> ee.Image:
-    """Append NBR = (NIR − SWIR2) / (NIR + SWIR2) scaled to [0, 10000] DN."""
     nbr    = image.normalizedDifference(["SR_B5", "SR_B7"]).rename("NBR")
-    nbr_dn = nbr.add(1.0).multiply(5000.0)   # maps [-1,1] → [0, 10000]
-    return image.addBands(nbr_dn)
+    nbr_01 = nbr.add(1.0).multiply(0.5)
+    return image.addBands(nbr_01)
 
 
 # ── Download one tile ─────────────────────────────────────────────────────
