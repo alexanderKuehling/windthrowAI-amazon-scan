@@ -119,7 +119,7 @@ def load_classifier(
 def load_segmenter(
     path:          Path         = SEGMENTER_PTH,
     device:        torch.device = torch.device("cuda"),
-    compile_model: bool         = True,
+    compile_model: bool         = False,
 ) -> nn.Module:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     raw_state  = _unwrap_state_dict(checkpoint) if isinstance(checkpoint, dict) else checkpoint
