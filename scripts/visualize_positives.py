@@ -11,14 +11,16 @@ import csv
 import sys
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
-from PIL import Image
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.config import OUTPUTS_DIR
+from src.config import BAND_NAMES, NORM_P5, NORM_P95, OUTPUTS_DIR
 from src.data import download_tile, init_gee
 
 
@@ -69,11 +71,30 @@ def main():
         overlay = rgb.copy()
         overlay[mask == 1] = [1.0, 0.0, 0.0]              # mark positive pixels in red
 
-        combined = np.concatenate([rgb, overlay], axis=1)  # side-by-side
-        img = Image.fromarray((combined * 255).astype(np.uint8))
+        fig, axes = plt.subplots(3, 3, figsize=(12, 12))
+        axes = axes.ravel()
+
+        for i, name in enumerate(BAND_NAMES):   # R, G, B, nIR, swIR1, swIR2, NBR
+            band = np.clip(ms[i], NORM_P5[i], NORM_P95[i])
+            band = (band - NORM_P5[i]) / (NORM_P95[i] - NORM_P5[i] + 1e-8)
+            axes[i].imshow(band, cmap="gray", vmin=0, vmax=1)
+            axes[i].set_title(name)
+            axes[i].axis("off")
+
+        axes[7].imshow(rgb)
+        axes[7].set_title("RGB")
+        axes[7].axis("off")
+
+        axes[8].imshow(overlay)
+        axes[8].set_title(f"mask overlay ({mask.mean()*100:.2f}%)")
+        axes[8].axis("off")
+
+        fig.suptitle(tile_id)
+        plt.tight_layout()
 
         out_path = out_dir / f"{tile_id}_viz.png"
-        img.save(out_path)
+        plt.savefig(out_path, dpi=120)
+        plt.close(fig)
         print(f"  saved {out_path}  ({mask.mean()*100:.2f}% positive pixels)")
 
 
