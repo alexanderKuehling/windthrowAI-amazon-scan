@@ -23,7 +23,7 @@ import torch
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.config import BATCH_SIZE, OUTPUTS_DIR, TILES_PER_JOB
+from src.config import BATCH_SIZE, OUTPUTS_DIR, SEGMENTER_BACKBONE, TILES_PER_JOB
 from src.data import download_tile, init_gee, preprocess, save_mask
 from src.models import load_segmenter
 from src.pipeline import segment_batch
@@ -33,6 +33,8 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--job-idx",        type=int, required=True)
     ap.add_argument("--segmenter-path", type=Path, required=True)
+    ap.add_argument("--backbone",       default=SEGMENTER_BACKBONE,
+                     help="smp encoder name matching the checkpoint, e.g. resnet34, vgg19_bn")
     ap.add_argument("--chunk-size",     type=int, default=TILES_PER_JOB)
     ap.add_argument("--results-csv",    type=Path, default=OUTPUTS_DIR / "all_results.csv")
     ap.add_argument("--out-dir",        type=Path, default=ROOT / "outputs_resegment")
@@ -49,7 +51,7 @@ def main():
     key_path = Path(args.key_path) if args.key_path else None
     init_gee(key_path=key_path)
 
-    segmenter = load_segmenter(args.segmenter_path, device)
+    segmenter = load_segmenter(args.segmenter_path, device, encoder_name=args.backbone)
     print(f"[resegment {args.job_idx}] segmenter loaded: {args.segmenter_path.name}")
 
     df  = pd.read_csv(args.results_csv)

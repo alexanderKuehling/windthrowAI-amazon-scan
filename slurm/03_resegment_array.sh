@@ -23,4 +23,5 @@ conda activate windthrowEnv
 python -u scripts/resegment.py \
     --job-idx "$SLURM_ARRAY_TASK_ID" \
     --segmenter-path models/segmenter_v2.pth \
+    --backbone resnet34 \
     --chunk-size 500

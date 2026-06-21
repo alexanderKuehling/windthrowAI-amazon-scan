@@ -120,6 +120,7 @@ def load_segmenter(
     path:          Path         = SEGMENTER_PTH,
     device:        torch.device = torch.device("cuda"),
     compile_model: bool         = False,
+    encoder_name:  str          = SEGMENTER_BACKBONE,
 ) -> nn.Module:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     raw_state  = _unwrap_state_dict(checkpoint) if isinstance(checkpoint, dict) else checkpoint
@@ -129,7 +130,7 @@ def load_segmenter(
     if not any(k.startswith("unet.") for k in raw_state):
         raw_state = {"unet." + k: v for k, v in raw_state.items()}
 
-    model = WindthrowSegmenter()
+    model = WindthrowSegmenter(encoder_name=encoder_name)
     model.load_state_dict(raw_state)
     model.to(device).eval()
     model = _maybe_data_parallel(model, device)
