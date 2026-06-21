@@ -1,4 +1,5 @@
 outputs/
+outputs_resegment/
 tile_grid.parquet
 slurm_logs/
 models/*.pth
