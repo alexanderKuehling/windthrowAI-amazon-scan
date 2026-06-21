@@ -8,7 +8,7 @@
 #SBATCH --job-name=WTAI_reseg
 #SBATCH --output=slurm_logs/reseg-%A_%a.out
 #SBATCH --error=slurm_logs/reseg-%A_%a.err
-#SBATCH --array=0-0          # adjust: ceil(num_positives / chunk_size) - 1
+#SBATCH --array=0-120       # adjust: ceil(num_positives / chunk_size) - 1
 #SBATCH --mail-type=FAIL
 
 mkdir -p slurm_logs

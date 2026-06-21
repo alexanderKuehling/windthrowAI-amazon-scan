@@ -8,7 +8,7 @@
 #SBATCH --job-name=WTAI_infer
 #SBATCH --output=slurm_logs/infer-%A_%a.out
 #SBATCH --error=slurm_logs/infer-%A_%a.err
-#SBATCH --array=0-119          # adjust 
+#SBATCH --array=0-115          # adjust 
 #SBATCH --mail-type=FAIL
 
 
