@@ -20,6 +20,7 @@ the target dataset repo.
 """
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -117,7 +118,8 @@ def export_tiles(mask_paths: list, zoom: str):
     if TILES_DIR.exists():
         shutil.rmtree(TILES_DIR)
     subprocess.run(
-        ["gdal2tiles.py", "-p", "mercator", "-z", zoom, "-w", "none",
+        ["gdal2tiles.py", "-p", "mercator", "-z", zoom, "-w", "none", "--xyz",
+         "-x", "--processes", str(os.cpu_count() or 4),
          str(VRT_PATH), str(TILES_DIR)],
         check=True,
     )
