@@ -99,13 +99,27 @@ def _build_composite(
         .filterBounds(region)
         .filterDate(date_from, date_to)
         .filter(ee.Filter.lt("CLOUD_COVER", max_cloud))
+        .map(_mask_landsat_clouds)
         .select(GEE_L8_BANDS)
-        .sort("CLOUD_COVER")
+        .sort("CLOUD_COVER", False)
     )
     if col.size().getInfo() == 0:
         return None
     mosaic = col.mosaic().clip(region)
     return mosaic.multiply(0.0000275).add(-0.2)
+
+
+def _mask_landsat_clouds(image: "ee.Image") -> "ee.Image":
+    qa = image.select("QA_PIXEL")
+    dilated_cloud = 1 << 1
+    cirrus = 1 << 2
+    cloud = 1 << 3
+    cloud_shadow = 1 << 4
+    mask = (qa.bitwiseAnd(dilated_cloud).eq(0)
+        .And(qa.bitwiseAnd(cirrus).eq(0))
+        .And(qa.bitwiseAnd(cloud).eq(0))
+        .And(qa.bitwiseAnd(cloud_shadow).eq(0)))
+    return image.updateMask(mask)
 
 
 def _add_nbr(image: ee.Image) -> ee.Image:
@@ -191,3 +205,29 @@ def save_mask(
         compress  = "lzw",
     ) as dst:
         dst.write(mask.astype(np.uint8), 1)
+
+
+def save_input(
+    ms: np.ndarray,
+    bbox: Tuple[float, float, float, float],
+    path: Path,
+) -> None:
+    """Write the raw (C, H, W) float32 model input (pre-normalization, same
+    band order as BAND_NAMES) as a compressed WGS-84 GeoTIFF."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lon_min, lat_min, lon_max, lat_max = bbox
+    transform = rasterio.transform.from_bounds(
+        lon_min, lat_min, lon_max, lat_max, ms.shape[2], ms.shape[1]
+    )
+    with rasterio.open(
+        path, "w",
+        driver    = "GTiff",
+        height    = ms.shape[1],
+        width     = ms.shape[2],
+        count     = ms.shape[0],
+        dtype     = rasterio.float32,
+        crs       = "EPSG:4326",
+        transform = transform,
+        compress  = "lzw",
+    ) as dst:
+        dst.write(ms.astype(np.float32))

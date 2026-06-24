@@ -30,7 +30,7 @@ from src.config import (
     SEGMENTER_PTH,
     TILES_PER_JOB,
 )
-from src.data import download_tile, init_gee, preprocess, save_mask
+from src.data import download_tile, init_gee, preprocess, save_input, save_mask
 from src.models import load_classifier, load_segmenter
 from src.pipeline import run_pipeline
 from src.tile_grid import get_job_tiles
@@ -76,7 +76,7 @@ def main():
     writer   = csv.writer(csv_file)
     if not done_ids:
         writer.writerow(["tile_id", "lon_min", "lat_min", "lon_max", "lat_max",
-                         "is_positive", "mask_path", "download_ok"])
+                         "is_positive", "mask_path", "input_path", "download_ok"])
 
     dl_kwargs: dict = {}
     if args.date_from: dl_kwargs["date_from"] = args.date_from
@@ -87,6 +87,7 @@ def main():
     pending_ids:    List[str]            = []
     pending_bboxes: List[tuple]          = []
     pending_arrays: List[np.ndarray]     = []
+    pending_raw:    List[np.ndarray]     = []
     failed_rows:    List[list]           = []
 
     t_dl_start = time.perf_counter()
@@ -97,11 +98,12 @@ def main():
         bbox = (row["lon_min"], row["lat_min"], row["lon_max"], row["lat_max"])
         ms   = download_tile(bbox, **dl_kwargs)
         if ms is None:
-            failed_rows.append([tile_id, *bbox, False, "", False])
+            failed_rows.append([tile_id, *bbox, False, "", "", False])
             continue
         pending_ids.append(tile_id)
         pending_bboxes.append(bbox)
-        pending_arrays.append(preprocess(ms).squeeze(0).numpy())  # (7, H, W)
+        pending_raw.append(ms)                                    # (7, H, W) raw
+        pending_arrays.append(preprocess(ms).squeeze(0).numpy())  # (7, H, W) normalised
 
     t_dl = time.perf_counter() - t_dl_start
     print(
@@ -130,14 +132,19 @@ def main():
 
     # ── Write results ─────────────────────────────────────────────────────
     n_pos = 0
-    for tile_id, bbox, pos, mask in zip(pending_ids, pending_bboxes, is_positive, masks):
+    for tile_id, bbox, pos, mask, raw in zip(pending_ids, pending_bboxes, is_positive, masks, pending_raw):
         mask_path = ""
+        input_path = ""
         if pos and mask is not None:
             n_pos += 1
             mp        = out_dir / f"{tile_id}_mask.tif"
             save_mask(mask, bbox, mp)
             mask_path = str(mp.relative_to(ROOT))
-        writer.writerow([tile_id, *bbox, pos, mask_path, True])
+
+            ip = out_dir / f"{tile_id}_input.tif"
+            save_input(raw, bbox, ip)
+            input_path = str(ip.relative_to(ROOT))
+        writer.writerow([tile_id, *bbox, pos, mask_path, input_path, True])
 
     csv_file.flush()
     csv_file.close()

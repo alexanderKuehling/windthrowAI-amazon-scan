@@ -24,7 +24,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.config import BATCH_SIZE, OUTPUTS_DIR, SEGMENTER_BACKBONE, TILES_PER_JOB
-from src.data import download_tile, init_gee, preprocess, save_mask
+from src.data import download_tile, init_gee, preprocess, save_input, save_mask
 from src.models import load_segmenter
 from src.pipeline import segment_batch
 
@@ -79,9 +79,9 @@ def main():
     writer   = csv.writer(csv_file)
     if not done_ids:
         writer.writerow(["tile_id", "lon_min", "lat_min", "lon_max", "lat_max",
-                          "is_positive", "mask_path"])
+                          "is_positive", "mask_path", "input_path"])
 
-    pending_ids, pending_bboxes, pending_arrays = [], [], []
+    pending_ids, pending_bboxes, pending_arrays, pending_raw = [], [], [], []
     failed_ids = []
 
     t0 = time.perf_counter()
@@ -96,6 +96,7 @@ def main():
             continue
         pending_ids.append(tile_id)
         pending_bboxes.append(bbox)
+        pending_raw.append(ms)
         pending_arrays.append(preprocess(ms).squeeze(0).numpy())
 
     print(
@@ -108,19 +109,25 @@ def main():
     for start_i in range(0, len(pending_arrays), effective_bs):
         batch_ids    = pending_ids[start_i : start_i + effective_bs]
         batch_bboxes = pending_bboxes[start_i : start_i + effective_bs]
+        batch_raw    = pending_raw[start_i : start_i + effective_bs]
         batch_np     = np.stack(pending_arrays[start_i : start_i + effective_bs], axis=0)
         batch_t      = torch.from_numpy(batch_np).to(device, non_blocking=True)
         masks        = segment_batch(batch_t, segmenter)
 
-        for tile_id, bbox, mask in zip(batch_ids, batch_bboxes, masks):
-            is_pos    = bool(mask.sum() > 0)
-            mask_path = ""
+        for tile_id, bbox, mask, raw in zip(batch_ids, batch_bboxes, masks, batch_raw):
+            is_pos     = bool(mask.sum() > 0)
+            mask_path  = ""
+            input_path = ""
             if is_pos:
                 n_pos += 1
                 mp = out_dir / f"{tile_id}_mask.tif"
                 save_mask(mask, bbox, mp)
                 mask_path = str(mp.relative_to(ROOT))
-            writer.writerow([tile_id, *bbox, is_pos, mask_path])
+
+                ip = out_dir / f"{tile_id}_input.tif"
+                save_input(raw, bbox, ip)
+                input_path = str(ip.relative_to(ROOT))
+            writer.writerow([tile_id, *bbox, is_pos, mask_path, input_path])
 
     csv_file.flush()
     csv_file.close()
