@@ -35,8 +35,6 @@ from shapely.geometry import shape
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.config import OUTPUTS_DIR
-
 RESEG_DIR    = ROOT / "outputs_resegment"
 WORK_DIR     = ROOT / "outputs_final"
 RGBA_DIR     = WORK_DIR / "rgba_masks"
@@ -56,19 +54,13 @@ def parse_args():
 
 
 def collect_final_masks() -> dict:
-    """tile_id -> mask path, preferring resegmented over original."""
+    """tile_id -> mask path, resegmented results only."""
     final = {}
-    for csv_path in sorted(OUTPUTS_DIR.glob("job_*/results.csv")):
-        df = pd.read_csv(csv_path)
-        for _, row in df[df["is_positive"] == True].iterrows():
-            if row["mask_path"]:
-                final[row["tile_id"]] = ROOT / row["mask_path"]
-
     for csv_path in sorted(RESEG_DIR.glob("job_*/results.csv")):
         df = pd.read_csv(csv_path)
         for _, row in df[df["is_positive"] == True].iterrows():
             if row["mask_path"]:
-                final[row["tile_id"]] = ROOT / row["mask_path"]  # overrides original
+                final[row["tile_id"]] = ROOT / row["mask_path"]
 
     return final
 
