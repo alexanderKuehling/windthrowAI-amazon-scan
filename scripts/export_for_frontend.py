@@ -60,11 +60,30 @@ def parse_args():
     return ap.parse_args()
 
 
+def _read_results_csv(csv_path: Path) -> pd.DataFrame:
+    """Read a results CSV tolerantly, handling mixed 7/8-column formats."""
+    try:
+        return pd.read_csv(csv_path)
+    except pd.errors.ParserError:
+        import csv as _csv
+        rows = []
+        with open(csv_path) as f:
+            reader = _csv.reader(f)
+            header = next(reader)
+            if "input_path" not in header:
+                header = header + ["input_path"]
+            for row in reader:
+                if len(row) < len(header):
+                    row = row + [""] * (len(header) - len(row))
+                rows.append(dict(zip(header, row[:len(header)])))
+        return pd.DataFrame(rows)
+
+
 def collect_final_results() -> dict:
     """tile_id -> {"mask_path", "input_path", "bbox"}, resegmented results only."""
     final = {}
     for csv_path in sorted(RESEG_DIR.glob("job_*/results.csv")):
-        df = pd.read_csv(csv_path)
+        df = _read_results_csv(csv_path)
         for _, row in df[df["is_positive"] == True].iterrows():
             if row["mask_path"]:
                 final[row["tile_id"]] = {
