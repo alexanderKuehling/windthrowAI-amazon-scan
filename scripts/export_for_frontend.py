@@ -13,7 +13,9 @@ Steps:
      and render a PNG tile pyramid with gdal2tiles.py.
   4. Stage each positive tile's raw 7-band model input GeoTIFF + a tile_id->bbox
      index CSV (for later lookup by location).
-  5. Upload geojson + tiles/ + inputs/ + inputs_index.csv to the HF dataset repo.
+  5. Stage each positive tile's proposed mask as a single-band uint8 GeoTIFF
+     (masks/{tile_id}.tif), aligned to inputs/{tile_id}.tif, for the Expert-Review tab.
+  6. Upload geojson + tiles/ + inputs/ + inputs_index.csv + masks/ to the HF dataset repo.
 
 Requires on PATH: gdalbuildvrt, gdal2tiles.py (part of GDAL).
 Requires Python packages: rasterio, geopandas, shapely, huggingface_hub.
@@ -44,6 +46,7 @@ WORK_DIR     = ROOT / "outputs_final"
 RGBA_DIR     = WORK_DIR / "rgba_masks"
 TILES_DIR    = WORK_DIR / "tiles"
 INPUTS_DIR   = WORK_DIR / "inputs"
+MASKS_DIR    = WORK_DIR / "masks"
 VRT_PATH     = WORK_DIR / "mosaic.vrt"
 GEOJSON_PATH = WORK_DIR / "windthrow.geojson"
 INPUTS_INDEX_PATH = WORK_DIR / "inputs_index.csv"
@@ -57,6 +60,7 @@ def parse_args():
     ap.add_argument("--zoom",    default="5-13", help="gdal2tiles.py -z range")
     ap.add_argument("--skip-tiles", action="store_true", help="only export GeoJSON, skip raster tiles")
     ap.add_argument("--skip-inputs", action="store_true", help="skip exporting model-input GeoTIFFs")
+    ap.add_argument("--skip-masks", action="store_true", help="skip exporting per-tile mask GeoTIFFs")
     return ap.parse_args()
 
 
@@ -173,7 +177,24 @@ def export_inputs(results: dict):
     print(f"  -> {INPUTS_INDEX_PATH}")
 
 
-def upload_to_hf(repo_id: str, skip_tiles: bool, skip_inputs: bool):
+def export_masks(results: dict):
+    """Stage each positive tile's proposed mask as masks/{tile_id}.tif — a single-band
+    uint8 (0/1) GeoTIFF on the same grid as inputs/{tile_id}.tif, so the Expert-Review
+    tab can load a per-pixel-editable proposed mask that lines up with the input imagery."""
+    entries = [(tid, r) for tid, r in results.items() if r["mask_path"] and r["mask_path"].exists()]
+    print(f"Staging {len(entries)} mask GeoTIFFs ...")
+    MASKS_DIR.mkdir(parents=True, exist_ok=True)
+    for tile_id, r in entries:
+        with rasterio.open(r["mask_path"]) as src:
+            mask    = (src.read(1) > 0).astype("uint8")
+            profile = src.profile
+        profile.update(count=1, dtype="uint8", nodata=None, compress="deflate")
+        with rasterio.open(MASKS_DIR / f"{tile_id}.tif", "w", **profile) as dst:
+            dst.write(mask, 1)
+    print(f"  -> {MASKS_DIR}  ({len(entries)} file(s))")
+
+
+def upload_to_hf(repo_id: str, skip_tiles: bool, skip_inputs: bool, skip_masks: bool):
     from huggingface_hub import HfApi
 
     api = HfApi()
@@ -215,6 +236,15 @@ def upload_to_hf(repo_id: str, skip_tiles: bool, skip_inputs: bool):
         )
         print("  uploaded inputs_index.csv")
 
+    if not skip_masks and MASKS_DIR.exists():
+        api.upload_folder(
+            folder_path=str(MASKS_DIR),
+            path_in_repo="masks",
+            repo_id=repo_id,
+            repo_type="dataset",
+        )
+        print("  uploaded masks/")
+
 
 def main():
     args = parse_args()
@@ -228,8 +258,10 @@ def main():
         export_tiles(mask_paths, args.zoom)
     if not args.skip_inputs:
         export_inputs(final_results)
+    if not args.skip_masks:
+        export_masks(final_results)
 
-    upload_to_hf(args.hf_repo, args.skip_tiles, args.skip_inputs)
+    upload_to_hf(args.hf_repo, args.skip_tiles, args.skip_inputs, args.skip_masks)
     print("Done.")
 
 

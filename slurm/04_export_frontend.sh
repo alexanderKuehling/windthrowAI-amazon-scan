@@ -17,4 +17,4 @@ CONDA_BASE=$(conda info --base)
 source $CONDA_BASE/etc/profile.d/conda.sh
 conda activate windthrowEnv
 
-python -u scripts/export_for_frontend.py
+python -u scripts/export_for_frontend.py --skip-tiles
