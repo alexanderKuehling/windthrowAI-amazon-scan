@@ -83,16 +83,26 @@ def _read_results_csv(csv_path: Path) -> pd.DataFrame:
         return pd.DataFrame(rows)
 
 
+def _is_true(v) -> bool:
+    """Robust truthiness — the fallback CSV parser yields the string 'True', not a bool."""
+    return v is True or (isinstance(v, str) and v.strip().lower() == "true")
+
+
+def _nonempty(v) -> bool:
+    return v is not None and str(v).strip() != "" and str(v).strip().lower() != "nan"
+
+
 def collect_final_results() -> dict:
     """tile_id -> {"mask_path", "input_path", "bbox"}, resegmented results only."""
     final = {}
     for csv_path in sorted(RESEG_DIR.glob("job_*/results.csv")):
         df = _read_results_csv(csv_path)
-        for _, row in df[df["is_positive"] == True].iterrows():
-            if row["mask_path"]:
+        positives = df[df["is_positive"].map(_is_true)]
+        for _, row in positives.iterrows():
+            if _nonempty(row.get("mask_path")):
                 final[row["tile_id"]] = {
-                    "mask_path":  ROOT / row["mask_path"],
-                    "input_path": ROOT / row["input_path"] if row.get("input_path") else None,
+                    "mask_path":  ROOT / str(row["mask_path"]).strip(),
+                    "input_path": ROOT / str(row["input_path"]).strip() if _nonempty(row.get("input_path")) else None,
                     "bbox": (row["lon_min"], row["lat_min"], row["lon_max"], row["lat_max"]),
                 }
 
