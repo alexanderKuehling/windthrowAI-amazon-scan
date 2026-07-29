@@ -12,7 +12,8 @@ Steps:
   3. Convert each mask to a red/transparent RGBA GeoTIFF, build a VRT mosaic,
      and render a PNG tile pyramid with gdal2tiles.py.
   4. Stage each positive tile's raw 7-band model input GeoTIFF + a tile_id->bbox
-     index CSV (for later lookup by location).
+     index CSV (for lookup by location) that also carries each tile's windthrow
+     `coverage` (%) so the Expert-Review tab can filter by coverage.
   5. Stage each positive tile's proposed mask as a single-band uint8 GeoTIFF
      (masks/{tile_id}.tif), aligned to inputs/{tile_id}.tif, for the Expert-Review tab.
   6. Upload geojson + tiles/ + inputs/ + inputs_index.csv + masks/ to the HF dataset repo.
@@ -90,6 +91,15 @@ def _is_true(v) -> bool:
 
 def _nonempty(v) -> bool:
     return v is not None and str(v).strip() != "" and str(v).strip().lower() != "nan"
+
+
+def mask_coverage_pct(mask_path: Path) -> float:
+    """Share of the tile flagged as windthrow in a proposed mask, in percent.
+    Mirrors the frontend's maskCoverage (fraction of nonzero mask pixels) so the
+    Expert-Review tab can filter tiles by coverage without decoding each mask."""
+    with rasterio.open(mask_path) as src:
+        mask = src.read(1) > 0
+    return round(float(mask.mean()) * 100.0, 2) if mask.size else 0.0
 
 
 def collect_final_results() -> dict:
@@ -170,7 +180,9 @@ def export_tiles(mask_paths: list, zoom: str):
 
 def export_inputs(results: dict):
     """Stage each positive tile's raw model-input GeoTIFF as inputs/{tile_id}.tif,
-    plus an index CSV of tile_id -> bbox so a tile can be looked up by location."""
+    plus an index CSV of tile_id -> bbox + windthrow coverage. The `coverage`
+    column (percent of the tile flagged as windthrow in the proposed mask) lets
+    the Expert-Review tab filter tiles by coverage without decoding each mask."""
     entries = [(tid, r) for tid, r in results.items() if r["input_path"] and r["input_path"].exists()]
     print(f"Staging {len(entries)} input GeoTIFFs ...")
     INPUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -179,8 +191,9 @@ def export_inputs(results: dict):
         dest = INPUTS_DIR / f"{tile_id}.tif"
         shutil.copyfile(r["input_path"], dest)
         lon_min, lat_min, lon_max, lat_max = r["bbox"]
+        coverage = mask_coverage_pct(r["mask_path"]) if r["mask_path"] and r["mask_path"].exists() else ""
         rows.append({"tile_id": tile_id, "lon_min": lon_min, "lat_min": lat_min,
-                     "lon_max": lon_max, "lat_max": lat_max})
+                     "lon_max": lon_max, "lat_max": lat_max, "coverage": coverage})
 
     pd.DataFrame(rows).to_csv(INPUTS_INDEX_PATH, index=False)
     print(f"  -> {INPUTS_DIR}  ({len(entries)} file(s))")

@@ -3,6 +3,12 @@ Main GPU inference script – called by the SLURM array job.
 
     python scripts/run_inference.py --job-idx $SLURM_ARRAY_TASK_ID
 
+Checkpoints and the segmenter encoder are selectable (same as scripts/resegment.py),
+so a checkpoint validated there can be run end-to-end here:
+
+    python scripts/run_inference.py --job-idx 0 \
+        --segmenter-path models/segmenter_v2.pth --backbone resnet34
+
 Outputs per job:
     outputs/job_{job_idx:04d}/results.csv         – metadata + positive flag per tile
     outputs/job_{job_idx:04d}/{tile_id}_mask.tif  – mask for positive tiles only
@@ -27,18 +33,24 @@ from src.config import (
     GEE_KEY_PATH,
     GRID_FILE,
     OUTPUTS_DIR,
+    SEGMENTER_BACKBONE,
     SEGMENTER_PTH,
     TILES_PER_JOB,
 )
 from src.data import download_tile, init_gee, preprocess, save_input, save_mask
 from src.models import load_classifier, load_segmenter
-from src.pipeline import run_pipeline
+from src.pipeline import classify_batch, segment_batch
 from src.tile_grid import get_job_tiles
 
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--job-idx",   type=int, required=True)
+    ap.add_argument("--job-idx",         type=int, required=True)
+    ap.add_argument("--classifier-path", type=Path, default=CLASSIFIER_PTH)
+    ap.add_argument("--segmenter-path",  type=Path, default=SEGMENTER_PTH)
+    ap.add_argument("--backbone",        default=SEGMENTER_BACKBONE,
+                    help="smp encoder name matching the segmenter checkpoint, "
+                         "e.g. resnet34, vgg19_bn")
     ap.add_argument("--key-path",  default=None,
                     help=f"GEE service-account JSON (default: {GEE_KEY_PATH})")
     ap.add_argument("--date-from", default=None)
@@ -56,9 +68,13 @@ def main():
     init_gee(key_path=key_path)
     print(f"[job {args.job_idx}] GEE initialised")
 
-    classifier = load_classifier(CLASSIFIER_PTH, device)
-    segmenter  = load_segmenter(SEGMENTER_PTH,  device)
-    print(f"[job {args.job_idx}] Models loaded")
+    classifier = load_classifier(args.classifier_path, device)
+    segmenter  = load_segmenter(args.segmenter_path, device, encoder_name=args.backbone)
+    print(
+        f"[job {args.job_idx}] Models loaded – "
+        f"classifier: {args.classifier_path.name}, "
+        f"segmenter: {args.segmenter_path.name} ({args.backbone})"
+    )
 
     tiles   = get_job_tiles(GRID_FILE, args.job_idx, TILES_PER_JOB)
     out_dir = OUTPUTS_DIR / f"job_{args.job_idx:04d}"
@@ -121,32 +137,49 @@ def main():
     effective_bs = BATCH_SIZE * max(n_gpus, 1)
 
     t_gpu_start = time.perf_counter()
-    is_positive, masks = run_pipeline(
-        pending_arrays, classifier, segmenter, device, batch_size=effective_bs
-    )
+    n_pos = 0
+    for start_i in range(0, len(pending_arrays), effective_bs):
+        batch_ids    = pending_ids[start_i : start_i + effective_bs]
+        batch_bboxes = pending_bboxes[start_i : start_i + effective_bs]
+        batch_raw    = pending_raw[start_i : start_i + effective_bs]
+        batch_np     = np.stack(pending_arrays[start_i : start_i + effective_bs], axis=0)
+        batch_t      = torch.from_numpy(batch_np).to(device, non_blocking=True)
+
+        # Stage 1: classify the whole batch
+        preds = classify_batch(batch_t, classifier)          # bool (B,)
+
+        # Stage 2: segment only the tiles the classifier gated through
+        pos_local = [i for i, p in enumerate(preds) if p]
+        masks: dict = {}
+        if pos_local:
+            idx       = torch.as_tensor(pos_local, device=batch_t.device)
+            seg_masks = segment_batch(batch_t.index_select(0, idx), segmenter)
+            masks     = {li: seg_masks[k] for k, li in enumerate(pos_local)}
+
+        # Write this batch out immediately – a crash keeps everything so far
+        for i, (tile_id, bbox, raw) in enumerate(zip(batch_ids, batch_bboxes, batch_raw)):
+            pos        = bool(preds[i])
+            mask       = masks.get(i)
+            mask_path  = ""
+            input_path = ""
+            if pos and mask is not None:
+                n_pos += 1
+                mp        = out_dir / f"{tile_id}_mask.tif"
+                save_mask(mask, bbox, mp)
+                mask_path = str(mp.relative_to(ROOT))
+
+                ip = out_dir / f"{tile_id}_input.tif"
+                save_input(raw, bbox, ip)
+                input_path = str(ip.relative_to(ROOT))
+            writer.writerow([tile_id, *bbox, pos, mask_path, input_path, True])
+        csv_file.flush()
+
     t_gpu = time.perf_counter() - t_gpu_start
     print(
         f"[job {args.job_idx}] GPU inference done in {t_gpu:.1f}s "
         f"({t_gpu / max(len(pending_arrays), 1) * 1000:.2f} ms/tile)"
     )
 
-    # ── Write results ─────────────────────────────────────────────────────
-    n_pos = 0
-    for tile_id, bbox, pos, mask, raw in zip(pending_ids, pending_bboxes, is_positive, masks, pending_raw):
-        mask_path = ""
-        input_path = ""
-        if pos and mask is not None:
-            n_pos += 1
-            mp        = out_dir / f"{tile_id}_mask.tif"
-            save_mask(mask, bbox, mp)
-            mask_path = str(mp.relative_to(ROOT))
-
-            ip = out_dir / f"{tile_id}_input.tif"
-            save_input(raw, bbox, ip)
-            input_path = str(ip.relative_to(ROOT))
-        writer.writerow([tile_id, *bbox, pos, mask_path, input_path, True])
-
-    csv_file.flush()
     csv_file.close()
 
     total = len(pending_arrays)

@@ -22,7 +22,11 @@ source $CONDA_BASE/etc/profile.d/conda.sh
 conda activate windthrowEnv
 
 
-python -u scripts/run_inference.py \
+# --segmenter-path / --backbone must match each other; defaults come from
+# src/config.py (SEGMENTER_PTH, SEGMENTER_BACKBONE).
+ python -u scripts/run_inference.py \
     --job-idx "$SLURM_ARRAY_TASK_ID" \
+    --segmenter-path models/segmenter_v2.pth \
+    --backbone resnet34 \
     --date-from "2024-06-01" \
     --date-to   "2024-09-30"
