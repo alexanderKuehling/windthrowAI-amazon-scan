@@ -11,7 +11,7 @@
 
 # One-time migration of the inputs/ already published in the HF dataset to the
 # compact uint16 encoding (~2.0 MB -> ~0.6 MB per tile). New exports need this
-# no more — 04_export_frontend.sh writes that encoding directly.
+# no more — 03_export_frontend.sh writes that encoding directly.
 #
 #   sbatch slurm/99_recompress_hf_inputs_one_time.sh            # dry run
 #   sbatch slurm/99_recompress_hf_inputs_one_time.sh --upload   # publish

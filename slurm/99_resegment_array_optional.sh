@@ -11,6 +11,11 @@
 #SBATCH --array=0-120       # adjust: ceil(num_positives / chunk_size) - 1
 #SBATCH --mail-type=FAIL
 
+# Optional, off the standard pipeline: re-segment the tiles already flagged
+# positive with a different checkpoint, without a full re-scan. The export step
+# takes outputs_resegment/ over outputs/ per tile, so this can also be run on a
+# subset — untouched tiles keep their original mask.
+
 mkdir -p slurm_logs
 
 module load cuda/12.1

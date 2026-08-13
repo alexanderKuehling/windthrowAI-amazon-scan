@@ -6,8 +6,8 @@ pyramid (PNG, Web Mercator z/x/y) for map overlay.
     python scripts/export_for_frontend.py
 
 Steps:
-  1. Pick the final mask per tile: prefer outputs_resegment/ (new segmenter)
-     over outputs/ (original run) when both exist.
+  1. Pick the final mask per tile: outputs/ (original run), overridden per tile by
+     outputs_resegment/ (new segmenter) where it exists. Re-segmentation is optional.
   2. Vectorize all final masks into one dissolved GeoJSON.
   3. Convert each mask to a red/transparent RGBA GeoTIFF, build a VRT mosaic,
      and render a PNG tile pyramid with gdal2tiles.py.
@@ -129,19 +129,45 @@ def encode_input_for_web(src_path: Path, dest_path: Path) -> None:
         dst.offsets = [WEB_OFFSET] * profile["count"]
 
 
+def _result_rows(csv_path: Path):
+    """Yield (tile_id, entry) per row of a results.csv; entry is None for a tile the
+    run rejected (negative, or positive but no mask recorded). Rows whose mask file
+    is missing are skipped entirely, so a half-written job can't drop a tile."""
+    df = _read_results_csv(csv_path)
+    for _, row in df.iterrows():
+        tile_id = row["tile_id"]
+        if not _is_true(row.get("is_positive")) or not _nonempty(row.get("mask_path")):
+            yield tile_id, None
+            continue
+        mask_path = ROOT / str(row["mask_path"]).strip()
+        if not mask_path.exists():
+            continue  # task died mid-write: skip the row rather than export a missing file
+        yield tile_id, {
+            "mask_path":  mask_path,
+            "input_path": ROOT / str(row["input_path"]).strip() if _nonempty(row.get("input_path")) else None,
+            "bbox": tuple(float(row[c]) for c in ("lon_min", "lat_min", "lon_max", "lat_max")),
+        }
+
+
 def collect_final_results() -> dict:
-    """tile_id -> {"mask_path", "input_path", "bbox"}, resegmented results only."""
+    """tile_id -> {"mask_path", "input_path", "bbox"} for every positive tile.
+
+    Starts from the original inference run (outputs/) and lets outputs_resegment/
+    override it per tile: a re-segmented tile replaces its original entry, and one
+    the new segmenter rejects is dropped. Re-segmentation is optional — with an
+    empty outputs_resegment/ the original masks are exported unchanged."""
     final = {}
+    for csv_path in sorted(ORIG_DIR.glob("job_*/results.csv")):
+        for tile_id, entry in _result_rows(csv_path):
+            if entry:
+                final[tile_id] = entry
+
     for csv_path in sorted(RESEG_DIR.glob("job_*/results.csv")):
-        df = _read_results_csv(csv_path)
-        positives = df[df["is_positive"].map(_is_true)]
-        for _, row in positives.iterrows():
-            if _nonempty(row.get("mask_path")):
-                final[row["tile_id"]] = {
-                    "mask_path":  ROOT / str(row["mask_path"]).strip(),
-                    "input_path": ROOT / str(row["input_path"]).strip() if _nonempty(row.get("input_path")) else None,
-                    "bbox": (row["lon_min"], row["lat_min"], row["lon_max"], row["lat_max"]),
-                }
+        for tile_id, entry in _result_rows(csv_path):
+            if entry:
+                final[tile_id] = entry
+            else:
+                final.pop(tile_id, None)  # re-segmented and rejected
 
     return final
 

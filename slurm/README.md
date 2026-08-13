@@ -12,19 +12,19 @@ sbatch slurm/00_generate_grid.sh
 All jobs activate the `windthrowEnv` conda environment. The GEE-facing and
 HF-facing jobs load `ml proxy` for outbound network access.
 
+`00`–`03` are the standard pipeline and run in that order. `99_*` scripts are
+exceptions: neither is part of a normal scan.
+
 | # | Script | Job | GPU | Array | Walltime | Reads | Writes |
 |---|--------|-----|-----|-------|----------|-------|--------|
 | 00 | `00_generate_grid.sh` | `WTAI_grid` | no | – | 15 min | `src/config.py` | `tile_grid.parquet` |
 | 01 | `01_inference_array.sh` | `WTAI_infer` | 2×A100 | yes | 4 h | `tile_grid.parquet` | `outputs/job_*/` |
 | 02 | `02_merge_results.sh` | `WTAI_merge` | no | – | 1 h | `outputs/job_*/results.csv` | `outputs/all_results.csv`, `.vrt`, `.geojson` |
-| 03 | `03_resegment_array.sh` | `WTAI_reseg` | 2×A100 | yes | 2 h | `outputs/all_results.csv` | `outputs_resegment/job_*/` |
-| 04 | `04_export_frontend.sh` | `WTAI_export` | no | – | 2 h | `outputs_resegment/job_*/` | `outputs_final/` + HF dataset |
+| 03 | `03_export_frontend.sh` | `WTAI_export` | no | – | 2 h | `outputs/`, `outputs_resegment/` | `outputs_final/` + HF dataset |
+| 99 | `99_resegment_array_optional.sh` | `WTAI_reseg` | 2×A100 | yes | 2 h | `outputs/all_results.csv` | `outputs_resegment/job_*/` |
 | 99 | `99_recompress_hf_inputs_one_time.sh` | `WTAI_recompress` | no | – | 3 h | HF dataset `inputs/` | HF dataset `inputs/` |
 
-Steps 00 → 04 run in order; each depends on the previous one having finished.
-99 is a one-off migration, not part of the pipeline (see below).
-
-## The steps
+## The standard pipeline
 
 ### 00 — Generate the tile grid
 
@@ -46,8 +46,8 @@ The main GPU pass. Each array task takes `TILES_PER_JOB` (2000) tiles from the
 grid, downloads the Landsat-8 dry-season composite for each from Google Earth
 Engine, runs the classifier, and segments the tiles it flags positive.
 
-Per task: `outputs/job_{idx:04d}/results.csv` plus `{tile_id}_mask.tif` and the
-7-band model input for positive tiles only.
+Per task: `outputs/job_{idx:04d}/results.csv` plus `{tile_id}_mask.tif` and
+`{tile_id}_input.tif` (the 7-band model input) for positive tiles only.
 
 Set `--array` to the range printed by step 00. The checkpoint and its encoder
 must match; `--segmenter-path`/`--backbone` in the script override the defaults
@@ -61,26 +61,11 @@ Needs GEE credentials: `gee-windthrowai-secret.json` in the repo root
 
 Concatenates every `outputs/job_*/results.csv` into `outputs/all_results.csv`,
 builds a VRT mosaic of the positive masks, and vectorises them to GeoJSON for
-QGIS. Prints the tile / positive / download-failure counts — worth reading
-before continuing, since **step 03's array size derives from the positive count**:
+QGIS. Prints the tile / positive / download-failure counts — worth reading, and
+required if you plan to re-segment (step 99 reads `all_results.csv`, and its
+array size derives from the positive count).
 
-```
---array=0-$(( (num_positives + 499) / 500 - 1 ))   # with --chunk-size 500
-```
-
-### 03 — Re-segment (array job)
-
-Re-runs *segmentation only* with a different checkpoint over the tiles already
-flagged positive, skipping classification and re-downloading only that small
-subset. This is how a newly validated segmenter reaches production without a
-full re-scan.
-
-Writes `outputs_resegment/job_*/`, mirroring step 01's layout.
-
-Not optional: **step 04 reads `outputs_resegment/` exclusively.** A scan that
-stops after 02 has nothing to export.
-
-### 04 — Export to the frontend
+### 03 — Export to the frontend
 
 Builds the final artefacts in `outputs_final/` and uploads them to the HF
 dataset `alexKlg/windthrowAI-dataset-segmentation_results`:
@@ -91,6 +76,10 @@ dataset `alexKlg/windthrowAI-dataset-segmentation_results`:
   encoding) and the tile_id → bbox + coverage index (Expert-Review tab)
 - `masks/` — per-tile proposed mask (Expert-Review tab)
 
+The masks come from `outputs/`, overridden per tile by `outputs_resegment/`
+where step 99 has produced one. With no re-segmentation, the original masks are
+exported unchanged.
+
 The script currently passes `--skip-tiles --skip-inputs`, i.e. it refreshes only
 the GeoJSON and masks. **Drop those flags to publish a full result set** — in
 particular `--skip-inputs` also skips `inputs_index.csv`. `--skip-tiles` is the
@@ -99,6 +88,25 @@ expensive one (gdal2tiles over z5–13).
 Needs `gdalbuildvrt` + `gdal2tiles.py` on PATH, and HF write access:
 `huggingface-cli login` on the cluster, or `HF_TOKEN` exported before submitting.
 
+## Exceptions
+
+### 99 — Re-segment (array job, optional)
+
+Re-runs *segmentation only* with a different checkpoint over the tiles already
+flagged positive, skipping classification and re-downloading only that small
+subset. This is how a newly validated segmenter reaches production without a
+full re-scan. Writes `outputs_resegment/job_*/`, mirroring step 01's layout.
+
+Run it between 02 and 03. The export overrides per tile, so a partial run is
+fine — tiles it never touched keep their original mask, and a tile the new
+segmenter rejects is dropped from the export.
+
+Its array size comes from the positive count printed by step 02:
+
+```bash
+--array=0-$(( (num_positives + 499) / 500 - 1 ))   # with --chunk-size 500
+```
+
 ### 99 — Recompress the published inputs (one-time)
 
 Migrates the `inputs/` already on HF from raw float32/LZW (~2.0 MB per tile) to
@@ -106,7 +114,7 @@ the compact uint16 encoding (~0.6 MB), which is what made every patch in the
 Expert-Review tab a multi-second download. Downloads `inputs/`, re-encodes,
 uploads back.
 
-One-off: step 04 writes that encoding directly now, and the script skips tiles
+One-off: step 03 writes that encoding directly now, and the script skips tiles
 that are already uint16, so a re-run is a no-op. Dry run by default:
 
 ```bash
@@ -116,8 +124,8 @@ sbatch slurm/99_recompress_hf_inputs_one_time.sh --upload   # publish
 
 ## Full run
 
-Steps 01 and 03 need an `--array` range that is only known once the preceding
-job has printed it, so the pipeline is not a single dependency chain end to end.
+Step 01 needs an `--array` range that is only known once step 00 has printed it,
+so the pipeline is not a single dependency chain end to end.
 
 ```bash
 cd windthrowAI-amazon-scan
@@ -127,10 +135,15 @@ sbatch slurm/00_generate_grid.sh
 
 sbatch --array=0-115 slurm/01_inference_array.sh
 sbatch --dependency=afterok:<infer_jobid> slurm/02_merge_results.sh
-# read the positive count from slurm_logs/merge-*.out
+sbatch --dependency=afterok:<merge_jobid> slurm/03_export_frontend.sh
+```
 
-sbatch --array=0-120 slurm/03_resegment_array.sh
-sbatch --dependency=afterok:<reseg_jobid> slurm/04_export_frontend.sh
+To swap in a new segmenter, insert the optional step before the export:
+
+```bash
+# after 02, read the positive count from slurm_logs/merge-*.out
+sbatch --array=0-120 slurm/99_resegment_array_optional.sh
+sbatch --dependency=afterok:<reseg_jobid> slurm/03_export_frontend.sh
 ```
 
 `--array` on the command line overrides the `#SBATCH --array` in the file, so
