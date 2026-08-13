@@ -5,8 +5,8 @@
 #SBATCH --mem=16G
 #SBATCH --time=03:00:00
 #SBATCH --job-name=WTAI_recompress
-#SBATCH --output=slurm_logs/recompress-%j.out
-#SBATCH --error=slurm_logs/recompress-%j.err
+#SBATCH --output=slurm_logs/recompress/%j.out
+#SBATCH --error=slurm_logs/recompress/%j.err
 #SBATCH --mail-type=FAIL
 
 # One-time migration of the inputs/ already published in the HF dataset to the

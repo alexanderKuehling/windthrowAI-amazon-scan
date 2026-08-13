@@ -5,8 +5,8 @@
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
 #SBATCH --job-name=WTAI_export
-#SBATCH --output=slurm_logs/export-%j.out
-#SBATCH --error=slurm_logs/export-%j.err
+#SBATCH --output=slurm_logs/export/%j.out
+#SBATCH --error=slurm_logs/export/%j.err
 #SBATCH --mail-type=FAIL
 
 mkdir -p slurm_logs

@@ -5,8 +5,8 @@
 #SBATCH --mem=8G
 #SBATCH --time=00:15:00
 #SBATCH --job-name=WTAI_grid
-#SBATCH --output=slurm_logs/grid-%j.out
-#SBATCH --error=slurm_logs/grid-%j.err
+#SBATCH --output=slurm_logs/grid/%j.out
+#SBATCH --error=slurm_logs/grid/%j.err
 
 mkdir -p slurm_logs
 

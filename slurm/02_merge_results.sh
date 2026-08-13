@@ -5,8 +5,8 @@
 #SBATCH --mem=32G
 #SBATCH --time=01:00:00
 #SBATCH --job-name=WTAI_merge
-#SBATCH --output=slurm_logs/merge-%j.out
-#SBATCH --error=slurm_logs/merge-%j.err
+#SBATCH --output=slurm_logs/merge/%j.out
+#SBATCH --error=slurm_logs/merge/%j.err
 
 mkdir -p slurm_logs
 
