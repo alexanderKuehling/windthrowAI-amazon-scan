@@ -15,6 +15,9 @@ HF-facing jobs load `ml proxy` for outbound network access.
 `00`–`03` are the standard pipeline and run in that order. `99_*` scripts are
 exceptions: neither is part of a normal scan.
 
+To re-run a scan from scratch, clear the previous one first —
+[`reset.md`](../reset.md) lists what to delete and what to keep.
+
 | # | Script | Job | GPU | Array | Walltime | Reads | Writes |
 |---|--------|-----|-----|-------|----------|-------|--------|
 | 00 | `00_generate_grid.sh` | `WTAI_grid` | no | – | 15 min | `src/config.py` | `tile_grid.parquet` |
@@ -46,8 +49,30 @@ The main GPU pass. Each array task takes `TILES_PER_JOB` (2000) tiles from the
 grid, downloads the Landsat-8 dry-season composite for each from Google Earth
 Engine, runs the classifier, and segments the tiles it flags positive.
 
-Per task: `outputs/job_{idx:04d}/results.csv` plus `{tile_id}_mask.tif` and
-`{tile_id}_input.tif` (the 7-band model input) for positive tiles only.
+Per task: `outputs/job_{idx:04d}/results.csv` and `run_meta.json`, plus
+`{tile_id}_mask.tif`, `{tile_id}_input.tif` (the 7-band model input) and
+`{tile_id}_prob.tif` (the segmenter probability map) for positive tiles only.
+
+`results.csv` records the model's **scores**, not just its decisions — see
+`src/results.py` for the column list:
+
+| Column | Written for | Why it is worth the disk |
+|--------|-------------|---------------------------|
+| `clf_prob` | every downloaded tile, negatives included | The classifier gate is the one irreversible step of the scan. With the probability stored, a threshold change is a CSV query; without it, it is a full re-scan. |
+| `valid_frac` | every downloaded tile | Share of pixels that survived cloud masking. A detection over a mostly-empty tile is the most common false positive. |
+| `n_scenes`, `date_first`, `date_last`, `cloud_mean` | every downloaded tile | Which imagery the composite was built from — needed to date a detection and to reproduce it. |
+| `coverage`, `mask_pixels` | positives | Extent of the proposed mask; drives the Expert-Review coverage filter. |
+| `seg_mean_prob`, `seg_mean_prob_in_mask`, `seg_max_prob` | positives | How confident the segmenter was, not just where it crossed 0.5. |
+| `prob_path` | positives | The `_prob.tif` (uint8, probability = DN/255, ~25 kB) that makes the segmentation threshold re-tunable offline. |
+
+`--clf-threshold` / `--seg-threshold` set the gates; both scores are recorded
+regardless of where the gates sit. `--no-prob-maps` skips the probability
+rasters — which also gives up post-hoc re-thresholding.
+
+Resuming is by `tile_id` against the existing `results.csv`, and a CSV from an
+older run is migrated to the current header on open (old rows padded with empty
+fields, never re-run). See [`reset.md`](../reset.md) before re-running a scan
+over a directory that already holds one.
 
 Set `--array` to the range printed by step 00. The checkpoint and its encoder
 must match; `--segmenter-path`/`--backbone` in the script override the defaults
@@ -72,18 +97,28 @@ dataset `alexKlg/windthrowAI-dataset-segmentation_results`:
 
 - `windthrow.geojson` — dissolved windthrow polygons (map vector layer)
 - `tiles/` — PNG tile pyramid, Web Mercator `z/x/y` (map raster overlay)
-- `inputs/` + `inputs_index.csv` — per-tile 7-band model input (uint16 web
-  encoding) and the tile_id → bbox + coverage index (Expert-Review tab)
+- `inputs/` — per-tile 7-band model input, uint16 web encoding (Expert-Review tab)
+- `inputs_index.csv` — the tile list the Expert-Review tab reads: `tile_id` →
+  bbox plus the per-tile scores from `results.csv` (`coverage`, `clf_prob`,
+  `seg_mean_prob_in_mask`, `seg_max_prob`, `valid_frac`, `n_scenes`,
+  `date_first`, `date_last`, `cloud_mean`, `source`)
 - `masks/` — per-tile proposed mask (Expert-Review tab)
+- `probs/` — per-tile segmenter probability map, only with `--include-probs`
 
 The masks come from `outputs/`, overridden per tile by `outputs_resegment/`
 where step 99 has produced one. With no re-segmentation, the original masks are
-exported unchanged.
+exported unchanged. `source` in the index records which of the two a tile came
+from; re-segmented tiles keep the `clf_prob` from the original scan, since
+step 99 never re-runs the classifier.
 
 The script currently passes `--skip-tiles --skip-inputs`, i.e. it refreshes only
-the GeoJSON and masks. **Drop those flags to publish a full result set** — in
-particular `--skip-inputs` also skips `inputs_index.csv`. `--skip-tiles` is the
-expensive one (gdal2tiles over z5–13).
+the GeoJSON, the index and the masks. **Drop those flags to publish a full
+result set.** `--skip-tiles` is the expensive one (gdal2tiles over z5–13).
+
+`inputs_index.csv` is *not* tied to `--skip-inputs`: it is one small file, it
+carries every per-tile score the review UI filters on, and skipping the bulk
+input rasters is no reason to leave it stale. Use `--skip-index` to suppress it
+explicitly.
 
 Needs `gdalbuildvrt` + `gdal2tiles.py` on PATH, and HF write access:
 `huggingface-cli login` on the cluster, or `HF_TOKEN` exported before submitting.

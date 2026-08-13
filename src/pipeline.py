@@ -15,29 +15,50 @@ from .config import (
 
 
 @torch.no_grad()
-def classify_batch(
+def classify_probs(
     tensors:    torch.Tensor,       # (B, 7, H, W) normalised, on device
+    classifier: nn.Module,
+) -> np.ndarray:
+    """Return float32 (B,) – windthrow probability per tile.
+
+    The probability, not just the thresholded decision, is what the scan records:
+    it is the only part of stage 1 that cannot be recovered without re-downloading
+    the imagery and re-running the GPU pass."""
+    with autocast(device_type="cuda", dtype=torch.float16):
+        logits = classifier(tensors)    # (B,)  – DataParallel gathers on cuda:0
+    return torch.sigmoid(logits.float()).cpu().numpy()
+
+
+def classify_batch(
+    tensors:    torch.Tensor,
     classifier: nn.Module,
     threshold:  float = CLASSIFIER_THRESHOLD,
 ) -> np.ndarray:
     """Return bool array (B,) – True = classifier predicts windthrow."""
-    with autocast(device_type="cuda", dtype=torch.float16):
-        logits = classifier(tensors)    # (B,)  – DataParallel gathers on cuda:0
-    probs = torch.sigmoid(logits.float()).cpu().numpy()
-    return probs >= threshold
+    return classify_probs(tensors, classifier) >= threshold
 
 
 @torch.no_grad()
-def segment_batch(
+def segment_probs(
     tensors:   torch.Tensor,        # (B, 7, H, W) normalised, on device
+    segmenter: nn.Module,
+) -> np.ndarray:
+    """Return float32 (B, H, W) – per-pixel windthrow probability.
+
+    Kept un-thresholded for the same reason as classify_probs: a saved probability
+    map can be re-thresholded later, a saved binary mask cannot."""
+    with autocast(device_type="cuda", dtype=torch.float16):
+        logits = segmenter(tensors)     # (B, 1, H, W) – gathered on cuda:0
+    return torch.sigmoid(logits.float()).squeeze(1).cpu().numpy()
+
+
+def segment_batch(
+    tensors:   torch.Tensor,
     segmenter: nn.Module,
     threshold: float = SEGMENTER_THRESHOLD,
 ) -> np.ndarray:
     """Return uint8 array (B, H, W) – binary segmentation masks."""
-    with autocast(device_type="cuda", dtype=torch.float16):
-        logits = segmenter(tensors)     # (B, 1, H, W) – gathered on cuda:0
-    probs = torch.sigmoid(logits.float()).squeeze(1).cpu().numpy()
-    return (probs >= threshold).astype(np.uint8)
+    return (segment_probs(tensors, segmenter) >= threshold).astype(np.uint8)
 
 
 def run_pipeline(

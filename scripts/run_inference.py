@@ -10,14 +10,25 @@ so a checkpoint validated there can be run end-to-end here:
         --segmenter-path models/segmenter_v2.pth --backbone resnet34
 
 Outputs per job:
-    outputs/job_{job_idx:04d}/results.csv         – metadata + positive flag per tile
+    outputs/job_{job_idx:04d}/results.csv         – metadata + scores per tile
+    outputs/job_{job_idx:04d}/run_meta.json       – checkpoints, thresholds, dates
     outputs/job_{job_idx:04d}/{tile_id}_mask.tif  – mask for positive tiles only
+    outputs/job_{job_idx:04d}/{tile_id}_input.tif – model input for positive tiles
+    outputs/job_{job_idx:04d}/{tile_id}_prob.tif  – segmenter probability map
+
+results.csv records the model's *scores*, not just its decisions: `clf_prob` for
+every downloaded tile (including negatives) and the segmenter probability map for
+every positive one. Both thresholds therefore become post-processing choices —
+re-thresholding needs no GPU pass and no second GEE download.
 """
 
 import argparse
-import csv
+import json
+import platform
+import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
@@ -30,16 +41,24 @@ sys.path.insert(0, str(ROOT))
 from src.config import (
     BATCH_SIZE,
     CLASSIFIER_PTH,
+    CLASSIFIER_THRESHOLD,
+    CLOUD_COVER_MAX,
+    DATE_FROM,
+    DATE_TO,
     GEE_KEY_PATH,
     GRID_FILE,
     OUTPUTS_DIR,
+    RESOLUTION_M,
     SEGMENTER_BACKBONE,
     SEGMENTER_PTH,
+    SEGMENTER_THRESHOLD,
+    TILE_SIZE_PX,
     TILES_PER_JOB,
 )
-from src.data import download_tile, init_gee, preprocess, save_input, save_mask
+from src.data import download_tile_with_meta, init_gee, preprocess, save_input, save_mask, save_prob_map
 from src.models import load_classifier, load_segmenter
-from src.pipeline import classify_batch, segment_batch
+from src.pipeline import classify_probs, segment_probs
+from src.results import base_row, fill_segmentation, open_results_csv
 from src.tile_grid import get_job_tiles
 
 
@@ -55,7 +74,24 @@ def parse_args():
                     help=f"GEE service-account JSON (default: {GEE_KEY_PATH})")
     ap.add_argument("--date-from", default=None)
     ap.add_argument("--date-to",   default=None)
+    ap.add_argument("--clf-threshold", type=float, default=CLASSIFIER_THRESHOLD,
+                    help="gate for stage 1; clf_prob is recorded regardless")
+    ap.add_argument("--seg-threshold", type=float, default=SEGMENTER_THRESHOLD,
+                    help="binarisation of the segmenter output; the probability "
+                         "map is saved regardless")
+    ap.add_argument("--no-prob-maps", action="store_true",
+                    help="skip {tile_id}_prob.tif (loses post-hoc re-thresholding)")
     return ap.parse_args()
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except Exception:  # noqa: BLE001 — provenance only
+        return ""
 
 
 def main():
@@ -80,19 +116,12 @@ def main():
     out_dir = OUTPUTS_DIR / f"job_{args.job_idx:04d}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Checkpoint: skip already-processed tiles ──────────────────────────
-    done_csv = out_dir / "results.csv"
-    done_ids: set = set()
-    if done_csv.exists():
-        with open(done_csv) as f:
-            done_ids = {row["tile_id"] for row in csv.DictReader(f)}
-        print(f"[job {args.job_idx}] Resuming – {len(done_ids)} tiles already done")
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    csv_file = open(done_csv, "a", newline="\n")
-    writer   = csv.writer(csv_file)
-    if not done_ids:
-        writer.writerow(["tile_id", "lon_min", "lat_min", "lon_max", "lat_max",
-                         "is_positive", "mask_path", "input_path", "download_ok"])
+    # ── Checkpoint: skip already-processed tiles ──────────────────────────
+    csv_file, writer, done_ids = open_results_csv(out_dir / "results.csv")
+    if done_ids:
+        print(f"[job {args.job_idx}] Resuming – {len(done_ids)} tiles already done")
 
     dl_kwargs: dict = {}
     if args.date_from: dl_kwargs["date_from"] = args.date_from
@@ -104,7 +133,8 @@ def main():
     pending_bboxes: List[tuple]          = []
     pending_arrays: List[np.ndarray]     = []
     pending_raw:    List[np.ndarray]     = []
-    failed_rows:    List[list]           = []
+    pending_meta:   List[dict]           = []
+    failed_rows:    List[dict]           = []
 
     t_dl_start = time.perf_counter()
     for _, row in tiles.iterrows():
@@ -112,12 +142,13 @@ def main():
         if tile_id in done_ids:
             continue
         bbox = (row["lon_min"], row["lat_min"], row["lon_max"], row["lat_max"])
-        ms   = download_tile(bbox, **dl_kwargs)
+        ms, meta = download_tile_with_meta(bbox, **dl_kwargs)
         if ms is None:
-            failed_rows.append([tile_id, *bbox, False, "", "", False])
+            failed_rows.append(base_row(tile_id, bbox, meta, download_ok=False))
             continue
         pending_ids.append(tile_id)
         pending_bboxes.append(bbox)
+        pending_meta.append(meta)
         pending_raw.append(ms)                                    # (7, H, W) raw
         pending_arrays.append(preprocess(ms).squeeze(0).numpy())  # (7, H, W) normalised
 
@@ -139,39 +170,56 @@ def main():
     t_gpu_start = time.perf_counter()
     n_pos = 0
     for start_i in range(0, len(pending_arrays), effective_bs):
-        batch_ids    = pending_ids[start_i : start_i + effective_bs]
-        batch_bboxes = pending_bboxes[start_i : start_i + effective_bs]
-        batch_raw    = pending_raw[start_i : start_i + effective_bs]
-        batch_np     = np.stack(pending_arrays[start_i : start_i + effective_bs], axis=0)
+        sl           = slice(start_i, start_i + effective_bs)
+        batch_ids    = pending_ids[sl]
+        batch_bboxes = pending_bboxes[sl]
+        batch_raw    = pending_raw[sl]
+        batch_meta   = pending_meta[sl]
+        batch_np     = np.stack(pending_arrays[sl], axis=0)
         batch_t      = torch.from_numpy(batch_np).to(device, non_blocking=True)
 
-        # Stage 1: classify the whole batch
-        preds = classify_batch(batch_t, classifier)          # bool (B,)
+        # Stage 1: classify the whole batch — the probability is kept, not just
+        # the gate decision, so the threshold can be revisited without a re-scan.
+        clf_probs = classify_probs(batch_t, classifier)      # float32 (B,)
+        preds     = clf_probs >= args.clf_threshold
 
         # Stage 2: segment only the tiles the classifier gated through
         pos_local = [i for i, p in enumerate(preds) if p]
-        masks: dict = {}
+        seg: dict = {}
         if pos_local:
-            idx       = torch.as_tensor(pos_local, device=batch_t.device)
-            seg_masks = segment_batch(batch_t.index_select(0, idx), segmenter)
-            masks     = {li: seg_masks[k] for k, li in enumerate(pos_local)}
+            idx  = torch.as_tensor(pos_local, device=batch_t.device)
+            maps = segment_probs(batch_t.index_select(0, idx), segmenter)  # (P, H, W)
+            seg  = {li: maps[k] for k, li in enumerate(pos_local)}
 
         # Write this batch out immediately – a crash keeps everything so far
-        for i, (tile_id, bbox, raw) in enumerate(zip(batch_ids, batch_bboxes, batch_raw)):
-            pos        = bool(preds[i])
-            mask       = masks.get(i)
-            mask_path  = ""
-            input_path = ""
-            if pos and mask is not None:
+        for i, (tile_id, bbox, raw, meta) in enumerate(
+            zip(batch_ids, batch_bboxes, batch_raw, batch_meta)
+        ):
+            record = base_row(tile_id, bbox, meta, download_ok=True)
+            record["clf_prob"] = round(float(clf_probs[i]), 6)
+
+            pos  = bool(preds[i])
+            prob = seg.get(i)
+            record["is_positive"] = pos
+            if pos and prob is not None:
                 n_pos += 1
-                mp        = out_dir / f"{tile_id}_mask.tif"
+                mask = (prob >= args.seg_threshold).astype(np.uint8)
+
+                mp = out_dir / f"{tile_id}_mask.tif"
                 save_mask(mask, bbox, mp)
-                mask_path = str(mp.relative_to(ROOT))
+                record["mask_path"] = str(mp.relative_to(ROOT))
 
                 ip = out_dir / f"{tile_id}_input.tif"
                 save_input(raw, bbox, ip)
-                input_path = str(ip.relative_to(ROOT))
-            writer.writerow([tile_id, *bbox, pos, mask_path, input_path, True])
+                record["input_path"] = str(ip.relative_to(ROOT))
+
+                if not args.no_prob_maps:
+                    pp = out_dir / f"{tile_id}_prob.tif"
+                    save_prob_map(prob, bbox, pp)
+                    record["prob_path"] = str(pp.relative_to(ROOT))
+
+                fill_segmentation(record, prob, mask)
+            writer.writerow(record)
         csv_file.flush()
 
     t_gpu = time.perf_counter() - t_gpu_start
@@ -184,6 +232,33 @@ def main():
 
     total = len(pending_arrays)
     print(f"[job {args.job_idx}] positives: {n_pos}/{total}")
+
+    # ── Run provenance ────────────────────────────────────────────────────
+    # Which checkpoints and thresholds produced this job's rows, recorded next to
+    # them: results.csv alone cannot tell two runs apart after the fact.
+    meta_path = out_dir / "run_meta.json"
+    meta_path.write_text(json.dumps({
+        "job_idx":              args.job_idx,
+        "started_at":           started_at,
+        "finished_at":          datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "classifier_path":      str(args.classifier_path),
+        "segmenter_path":       str(args.segmenter_path),
+        "segmenter_backbone":   args.backbone,
+        "classifier_threshold": args.clf_threshold,
+        "segmenter_threshold":  args.seg_threshold,
+        "date_from":            args.date_from or DATE_FROM,
+        "date_to":              args.date_to   or DATE_TO,
+        "cloud_cover_max":      CLOUD_COVER_MAX,
+        "tile_size_px":         TILE_SIZE_PX,
+        "resolution_m":         RESOLUTION_M,
+        "prob_maps":            not args.no_prob_maps,
+        "n_tiles_processed":    total,
+        "n_download_failed":    len(failed_rows),
+        "n_positive":           n_pos,
+        "git_commit":           _git_commit(),
+        "host":                 platform.node(),
+    }, indent=2))
+    print(f"[job {args.job_idx}] wrote {meta_path.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

@@ -12,12 +12,17 @@ Steps:
   3. Convert each mask to a red/transparent RGBA GeoTIFF, build a VRT mosaic,
      and render a PNG tile pyramid with gdal2tiles.py.
   4. Stage each positive tile's 7-band model input as a compact uint16 GeoTIFF
-     (encode_input_for_web) + a tile_id->bbox
-     index CSV (for lookup by location) that also carries each tile's windthrow
-     `coverage` (%) so the Expert-Review tab can filter by coverage.
-  5. Stage each positive tile's proposed mask as a single-band uint8 GeoTIFF
+     (encode_input_for_web).
+  5. Write inputs_index.csv: tile_id -> bbox plus the per-tile scores the scan
+     recorded (windthrow `coverage` %, classifier confidence `clf_prob`, segmenter
+     confidence, `valid_frac` / `cloud_mean` / acquisition dates), so the
+     Expert-Review tab can filter and prioritise tiles without fetching imagery.
+  6. Stage each positive tile's proposed mask as a single-band uint8 GeoTIFF
      (masks/{tile_id}.tif), aligned to inputs/{tile_id}.tif, for the Expert-Review tab.
-  6. Upload geojson + tiles/ + inputs/ + inputs_index.csv + masks/ to the HF dataset repo.
+  7. Optionally (--include-probs) stage the segmenter probability maps as
+     probs/{tile_id}.tif (uint8, probability = DN/255).
+  8. Upload geojson + tiles/ + inputs/ + inputs_index.csv + masks/ (+ probs/) to
+     the HF dataset repo.
 
 Requires on PATH: gdalbuildvrt, gdal2tiles.py (part of GDAL).
 Requires Python packages: rasterio, geopandas, shapely, huggingface_hub.
@@ -49,6 +54,7 @@ RGBA_DIR     = WORK_DIR / "rgba_masks"
 TILES_DIR    = WORK_DIR / "tiles"
 INPUTS_DIR   = WORK_DIR / "inputs"
 MASKS_DIR    = WORK_DIR / "masks"
+PROBS_DIR    = WORK_DIR / "probs"
 VRT_PATH     = WORK_DIR / "mosaic.vrt"
 GEOJSON_PATH = WORK_DIR / "windthrow.geojson"
 INPUTS_INDEX_PATH = WORK_DIR / "inputs_index.csv"
@@ -68,6 +74,12 @@ def parse_args():
     ap.add_argument("--skip-tiles", action="store_true", help="only export GeoJSON, skip raster tiles")
     ap.add_argument("--skip-inputs", action="store_true", help="skip exporting model-input GeoTIFFs")
     ap.add_argument("--skip-masks", action="store_true", help="skip exporting per-tile mask GeoTIFFs")
+    ap.add_argument("--skip-index", action="store_true",
+                    help="skip inputs_index.csv (the tile list + per-tile scores the "
+                         "Expert-Review tab reads); it is cheap and is written even "
+                         "with --skip-inputs")
+    ap.add_argument("--include-probs", action="store_true",
+                    help="also publish probs/{tile_id}.tif, the segmenter probability maps")
     return ap.parse_args()
 
 
@@ -129,6 +141,25 @@ def encode_input_for_web(src_path: Path, dest_path: Path) -> None:
         dst.offsets = [WEB_OFFSET] * profile["count"]
 
 
+# Per-tile scores the scan records alongside each mask (see src/results.py). They
+# are copied into inputs_index.csv so the Expert-Review tab can show and filter on
+# model confidence and image quality without downloading anything.
+METRIC_COLUMNS = [
+    "coverage", "clf_prob", "seg_mean_prob_in_mask", "seg_max_prob",
+    "valid_frac", "n_scenes", "date_first", "date_last", "cloud_mean",
+]
+
+
+def _metrics(row) -> dict:
+    """Copy the metric columns a results.csv carries; missing ones stay empty so
+    an index built from an older run keeps the same shape."""
+    out = {}
+    for col in METRIC_COLUMNS:
+        val = row.get(col)
+        out[col] = str(val).strip() if _nonempty(val) else ""
+    return out
+
+
 def _result_rows(csv_path: Path):
     """Yield (tile_id, entry) per row of a results.csv; entry is None for a tile the
     run rejected (negative, or positive but no mask recorded). Rows whose mask file
@@ -145,7 +176,9 @@ def _result_rows(csv_path: Path):
         yield tile_id, {
             "mask_path":  mask_path,
             "input_path": ROOT / str(row["input_path"]).strip() if _nonempty(row.get("input_path")) else None,
+            "prob_path":  ROOT / str(row["prob_path"]).strip() if _nonempty(row.get("prob_path")) else None,
             "bbox": tuple(float(row[c]) for c in ("lon_min", "lat_min", "lon_max", "lat_max")),
+            "metrics": _metrics(row),
         }
 
 
@@ -160,11 +193,18 @@ def collect_final_results() -> dict:
     for csv_path in sorted(ORIG_DIR.glob("job_*/results.csv")):
         for tile_id, entry in _result_rows(csv_path):
             if entry:
+                entry["source"] = "scan"
                 final[tile_id] = entry
 
     for csv_path in sorted(RESEG_DIR.glob("job_*/results.csv")):
         for tile_id, entry in _result_rows(csv_path):
             if entry:
+                # Re-segmentation never re-runs the classifier, so keep the stage-1
+                # score from the original scan when the new row doesn't carry one.
+                prev = final.get(tile_id)
+                if prev and not entry["metrics"].get("clf_prob"):
+                    entry["metrics"]["clf_prob"] = prev["metrics"].get("clf_prob", "")
+                entry["source"] = "resegment"
                 final[tile_id] = entry
             else:
                 final.pop(tile_id, None)  # re-segmented and rejected
@@ -231,27 +271,70 @@ def export_tiles(mask_paths: list, zoom: str):
     )
 
 
+def _reviewable(results: dict) -> list:
+    """(tile_id, entry) for every tile that has a model input to publish — the set
+    the Expert-Review tab can actually show."""
+    return [(tid, r) for tid, r in results.items() if r["input_path"] and r["input_path"].exists()]
+
+
 def export_inputs(results: dict):
-    """Stage each positive tile's model-input GeoTIFF as inputs/{tile_id}.tif (uint16
-    web encoding, see encode_input_for_web), plus an index CSV of tile_id -> bbox +
-    windthrow coverage. The `coverage` column (percent of the tile flagged as windthrow
-    in the proposed mask) lets the Expert-Review tab filter tiles by coverage without
-    decoding each mask."""
-    entries = [(tid, r) for tid, r in results.items() if r["input_path"] and r["input_path"].exists()]
+    """Stage each positive tile's model-input GeoTIFF as inputs/{tile_id}.tif
+    (uint16 web encoding, see encode_input_for_web)."""
+    entries = _reviewable(results)
     print(f"Staging {len(entries)} input GeoTIFFs ...")
     INPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    for tile_id, r in entries:
+        encode_input_for_web(r["input_path"], INPUTS_DIR / f"{tile_id}.tif")
+    print(f"  -> {INPUTS_DIR}  ({len(entries)} file(s))")
+
+
+def export_index(results: dict):
+    """Write inputs_index.csv: one row per reviewable tile with its bbox and the
+    scores the scan recorded for it.
+
+    `coverage` (percent of the tile flagged as windthrow) lets the Expert-Review
+    tab filter tiles without decoding each mask; `clf_prob` and the seg_* columns
+    carry the model's confidence, `valid_frac`/`cloud_mean`/`date_*` the quality
+    and date of the imagery behind the detection. Everything comes from
+    results.csv — only `coverage` is recomputed from the mask when an older run
+    didn't record it."""
+    entries = _reviewable(results)
     rows = []
     for tile_id, r in entries:
-        dest = INPUTS_DIR / f"{tile_id}.tif"
-        encode_input_for_web(r["input_path"], dest)
         lon_min, lat_min, lon_max, lat_max = r["bbox"]
-        coverage = mask_coverage_pct(r["mask_path"]) if r["mask_path"] and r["mask_path"].exists() else ""
-        rows.append({"tile_id": tile_id, "lon_min": lon_min, "lat_min": lat_min,
-                     "lon_max": lon_max, "lat_max": lat_max, "coverage": coverage})
+        metrics = dict(r.get("metrics") or {})
+        if not metrics.get("coverage") and r["mask_path"] and r["mask_path"].exists():
+            metrics["coverage"] = mask_coverage_pct(r["mask_path"])
+        rows.append({
+            "tile_id": tile_id,
+            "lon_min": lon_min, "lat_min": lat_min,
+            "lon_max": lon_max, "lat_max": lat_max,
+            **{col: metrics.get(col, "") for col in METRIC_COLUMNS},
+            "source": r.get("source", ""),
+        })
 
+    if not rows:
+        # An empty index would take every tile out of the Expert-Review tab. That
+        # is almost always a missing/cleared outputs/ rather than a real result,
+        # so leave whatever is published in place and say so.
+        print("  !! no reviewable tiles found — keeping the existing inputs_index.csv")
+        return
+
+    INPUTS_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(INPUTS_INDEX_PATH, index=False)
-    print(f"  -> {INPUTS_DIR}  ({len(entries)} file(s))")
-    print(f"  -> {INPUTS_INDEX_PATH}")
+    print(f"  -> {INPUTS_INDEX_PATH}  ({len(rows)} row(s))")
+
+
+def export_probs(results: dict):
+    """Stage each positive tile's segmenter probability map as probs/{tile_id}.tif
+    (uint8, probability = DN/255). Optional: the review UI does not need it, but
+    publishing it lets a client re-threshold a detection without the GPU pass."""
+    entries = [(tid, r) for tid, r in results.items() if r.get("prob_path") and r["prob_path"].exists()]
+    print(f"Staging {len(entries)} probability maps ...")
+    PROBS_DIR.mkdir(parents=True, exist_ok=True)
+    for tile_id, r in entries:
+        shutil.copyfile(r["prob_path"], PROBS_DIR / f"{tile_id}.tif")
+    print(f"  -> {PROBS_DIR}  ({len(entries)} file(s))")
 
 
 def export_masks(results: dict):
@@ -271,7 +354,7 @@ def export_masks(results: dict):
     print(f"  -> {MASKS_DIR}  ({len(entries)} file(s))")
 
 
-def upload_to_hf(repo_id: str, skip_tiles: bool, skip_inputs: bool, skip_masks: bool):
+def upload_to_hf(repo_id: str, args):
     from huggingface_hub import HfApi
 
     api = HfApi()
@@ -286,7 +369,7 @@ def upload_to_hf(repo_id: str, skip_tiles: bool, skip_inputs: bool, skip_masks: 
         )
         print("  uploaded windthrow.geojson")
 
-    if not skip_tiles and TILES_DIR.exists():
+    if not args.skip_tiles and TILES_DIR.exists():
         api.upload_folder(
             folder_path=str(TILES_DIR),
             path_in_repo="tiles",
@@ -295,7 +378,7 @@ def upload_to_hf(repo_id: str, skip_tiles: bool, skip_inputs: bool, skip_masks: 
         )
         print("  uploaded tiles/")
 
-    if not skip_inputs and INPUTS_DIR.exists():
+    if not args.skip_inputs and INPUTS_DIR.exists():
         api.upload_folder(
             folder_path=str(INPUTS_DIR),
             path_in_repo="inputs",
@@ -304,7 +387,10 @@ def upload_to_hf(repo_id: str, skip_tiles: bool, skip_inputs: bool, skip_masks: 
         )
         print("  uploaded inputs/")
 
-    if not skip_inputs and INPUTS_INDEX_PATH.exists():
+    # Deliberately not tied to --skip-inputs: the index is the tile list and the
+    # per-tile scores the review UI reads, it costs one small file, and skipping
+    # the (large) input rasters is no reason to leave it stale.
+    if not args.skip_index and INPUTS_INDEX_PATH.exists():
         api.upload_file(
             path_or_fileobj=str(INPUTS_INDEX_PATH),
             path_in_repo="inputs_index.csv",
@@ -313,7 +399,7 @@ def upload_to_hf(repo_id: str, skip_tiles: bool, skip_inputs: bool, skip_masks: 
         )
         print("  uploaded inputs_index.csv")
 
-    if not skip_masks and MASKS_DIR.exists():
+    if not args.skip_masks and MASKS_DIR.exists():
         api.upload_folder(
             folder_path=str(MASKS_DIR),
             path_in_repo="masks",
@@ -321,6 +407,15 @@ def upload_to_hf(repo_id: str, skip_tiles: bool, skip_inputs: bool, skip_masks: 
             repo_type="dataset",
         )
         print("  uploaded masks/")
+
+    if args.include_probs and PROBS_DIR.exists():
+        api.upload_folder(
+            folder_path=str(PROBS_DIR),
+            path_in_repo="probs",
+            repo_id=repo_id,
+            repo_type="dataset",
+        )
+        print("  uploaded probs/")
 
 
 def main():
@@ -335,10 +430,14 @@ def main():
         export_tiles(mask_paths, args.zoom)
     if not args.skip_inputs:
         export_inputs(final_results)
+    if not args.skip_index:
+        export_index(final_results)
     if not args.skip_masks:
         export_masks(final_results)
+    if args.include_probs:
+        export_probs(final_results)
 
-    upload_to_hf(args.hf_repo, args.skip_tiles, args.skip_inputs, args.skip_masks)
+    upload_to_hf(args.hf_repo, args)
     print("Done.")
 
 
