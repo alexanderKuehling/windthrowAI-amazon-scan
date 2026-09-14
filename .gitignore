@@ -1,5 +1,7 @@
 outputs/
 outputs_resegment/
+# HF snapshot cache of summarize_reviews.py (the CSVs next to it are kept)
+outputs_final/reviews/download/
 tile_grid.parquet
 slurm_logs/
 models/*.pth
@@ -11,3 +13,4 @@ __pycache__/
 .venv/
 *.tif
 *.png
+*.csv

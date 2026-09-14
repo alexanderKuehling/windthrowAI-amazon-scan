@@ -13,7 +13,7 @@ All jobs activate the `windthrowEnv` conda environment. The GEE-facing and
 HF-facing jobs load `ml proxy` for outbound network access.
 
 `00`–`03` are the standard pipeline and run in that order. `99_*` scripts are
-exceptions: neither is part of a normal scan.
+exceptions: none of them is part of a normal scan.
 
 To re-run a scan from scratch, clear the previous one first —
 [`reset.md`](../reset.md) lists what to delete and what to keep.
@@ -26,6 +26,7 @@ To re-run a scan from scratch, clear the previous one first —
 | 03 | `03_export_frontend.sh` | `WTAI_export` | no | – | 2 h | `outputs/`, `outputs_resegment/` | `outputs_final/` + HF dataset |
 | 99 | `99_resegment_array_optional.sh` | `WTAI_reseg` | 2×A100 | yes | 2 h | `outputs/all_results.csv` | `outputs_resegment/job_*/` |
 | 99 | `99_recompress_hf_inputs_one_time.sh` | `WTAI_recompress` | no | – | 3 h | HF dataset `inputs/` | HF dataset `inputs/` |
+| 99 | `99_summarize_reviews.sh` | `WTAI_reviewstats` | no | – | 30 min | HF dataset `reviews/` | `outputs_final/reviews/*.csv` |
 
 ## The standard pipeline
 
@@ -156,6 +157,41 @@ that are already uint16, so a re-run is a no-op. Dry run by default:
 sbatch slurm/99_recompress_hf_inputs_one_time.sh            # report the size win only
 sbatch slurm/99_recompress_hf_inputs_one_time.sh --upload   # publish
 ```
+
+### 99 — Summarise the expert reviews
+
+Read-only report on how much review signal has accumulated in the dataset,
+split into what it can train. Run it before opening a retraining round — it is
+what tells you whether there is enough, and how much reviewer redundancy sits
+behind each tile.
+
+```bash
+sbatch slurm/99_summarize_reviews.sh                     # full report
+sbatch slurm/99_summarize_reviews.sh --fast              # counts only, no JSON download
+sbatch slurm/99_summarize_reviews.sh --since 2026-08-01  # only recent reviews
+```
+
+Reviews live in the same dataset as `reviews/{tile_id}/{ts}__p{pixels}__{reviewer}.json`
+plus the corrected mask PNG next to it, written by the tileloading backend. One
+record carries both training signals:
+
+| Signal | Comes from | Reported as |
+|--------|-----------|-------------|
+| Classification | the verdict — `confirmed`/`edited` is a confirmed true positive, `no_windthrow` a corrected false positive | labelled tiles, labels per tile, majority label per tile, unanimous vs. split among multi-reviewed tiles |
+| Segmentation | the mask PNG — `edited` is a redrawn mask, `confirmed` endorses the proposed one, `no_windthrow` implies an empty one | distinct corrected tiles, usable mask targets per tile, pixels changed |
+
+Every reviewed tile passed the stage-1 gate, so the classification labels are
+confirmations and false-positive corrections of the *current* classifier — the
+round adds no new negatives from outside the positive set.
+
+`--fast` works off the file listing alone (it encodes timestamp, changed-pixel
+count and reviewer). That covers the counts and the per-tile averages but not
+the verdicts, so the classification/segmentation split needs a full run.
+
+Two CSVs land in `outputs_final/reviews/` (`--no-csv` to suppress):
+`review_summary_per_tile.csv` — one row per reviewed tile with its verdict
+counts, majority label, whether the reviewers agreed and the latest mask path,
+which is the label set a retraining reads — and `review_summary_per_reviewer.csv`.
 
 ## Full run
 
