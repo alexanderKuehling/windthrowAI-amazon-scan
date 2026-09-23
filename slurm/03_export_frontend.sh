@@ -8,6 +8,9 @@
 #SBATCH --output=slurm_logs/export/%j.out
 #SBATCH --error=slurm_logs/export/%j.err
 #SBATCH --mail-type=FAIL
+#SBATCH --kill-on-invalid-dep=yes
+
+set -euo pipefail
 
 mkdir -p slurm_logs
 

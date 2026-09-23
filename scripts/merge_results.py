@@ -8,6 +8,7 @@ Outputs:
     outputs/all_results.csv          – full tile-level results
     outputs/windthrow_amazon.vrt     – virtual mosaic (open in QGIS / gdal)
     outputs/windthrow_amazon.geojson – vectorised windthrow polygons
+
 """
 
 import subprocess
@@ -23,7 +24,9 @@ from shapely.geometry import shape
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.config import OUTPUTS_DIR
+from src.config import GRID_FILE, OUTPUTS_DIR, TILES_PER_JOB
+from src.tile_grid import n_jobs
+
 
 
 def main():
@@ -32,6 +35,15 @@ def main():
     if not csv_files:
         print("No result CSVs found. Run inference first.")
         return
+
+    expected = n_jobs(GRID_FILE, TILES_PER_JOB)
+    if len(csv_files) != expected:
+        sys.exit(
+            f"expected {expected} job dirs (per tile_grid.parquet), found "
+            f"{len(csv_files)} — refusing to merge a partial run. Check "
+            "slurm_logs/infer/ for failed array tasks and resubmit them "
+            "(sbatch --array=<idx> slurm/01_inference_array.sh) before merging."
+        )
 
     df = pd.concat([pd.read_csv(f) for f in csv_files], ignore_index=True)
     df.to_csv(OUTPUTS_DIR / "all_results.csv", index=False)

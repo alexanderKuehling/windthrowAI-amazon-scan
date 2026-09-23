@@ -19,6 +19,7 @@ cd windthrowAI-amazon-scan
 | `slurm_logs/` | every job | optional |
 | `src/__pycache__`, `scripts/__pycache__` | Python | optional |
 | `tile_grid.parquet` | 00 generate grid | **no** — see below |
+| `model_versions.json` | 00 (resolve_model_versions.py) | doesn't matter — overwritten fresh on every `00` run, unlike `tile_grid.parquet` it is never meant to be kept |
 | `models/`, `gee-windthrowai-secret.json` | you | **never** |
 
 ## Start from zero
@@ -112,8 +113,17 @@ work.
 ## After the reset
 
 ```bash
-sbatch slurm/00_generate_grid.sh          # only if tile_grid.parquet was deleted
-# read the printed "--array=0-N" from slurm_logs/grid-*.out
+slurm/run_full_scan.sh
+```
+
+Chains `00 → 01 → 02 → 03` automatically (waits for `00`, reads the array size
+from `tile_grid.parquet`, wires the `--dependency=afterok` chain) — run it
+under `tmux`/`screen` since it blocks on step 00 for ~15 min. Spelled out by
+hand instead:
+
+```bash
+sbatch slurm/00_generate_grid.sh          # regenerates tile_grid.parquet (if deleted) and model_versions.json
+# read the printed "--array=0-N" from slurm_logs/grid/*.out
 
 sbatch --array=0-115 slurm/01_inference_array.sh
 sbatch --dependency=afterok:<infer_jobid> slurm/02_merge_results.sh

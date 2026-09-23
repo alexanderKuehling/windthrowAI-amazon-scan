@@ -6,8 +6,12 @@ relative to it (`scripts/`, `outputs/`, `slurm_logs/`):
 
 ```bash
 cd windthrowAI-amazon-scan
-sbatch slurm/00_generate_grid.sh
+slurm/run_full_scan.sh
 ```
+
+That one command chains the whole `00`–`03` sequence (see "Full run" below).
+The rest of this doc describes each step individually — useful for running a
+single step by hand, debugging, or resubmitting a failed array task.
 
 All jobs activate the `windthrowEnv` conda environment. The GEE-facing and
 HF-facing jobs load `ml proxy` for outbound network access.
@@ -20,7 +24,7 @@ To re-run a scan from scratch, clear the previous one first —
 
 | # | Script | Job | GPU | Array | Walltime | Reads | Writes |
 |---|--------|-----|-----|-------|----------|-------|--------|
-| 00 | `00_generate_grid.sh` | `WTAI_grid` | no | – | 15 min | `src/config.py` | `tile_grid.parquet` |
+| 00 | `00_generate_grid.sh` | `WTAI_grid` | no | – | 15 min | `src/config.py`, HF model repos | `tile_grid.parquet`, `model_versions.json` |
 | 01 | `01_inference_array.sh` | `WTAI_infer` | 2×A100 | yes | 4 h | `tile_grid.parquet` | `outputs/job_*/` |
 | 02 | `02_merge_results.sh` | `WTAI_merge` | no | – | 1 h | `outputs/job_*/results.csv` | `outputs/all_results.csv`, `.vrt`, `.geojson` |
 | 03 | `03_export_frontend.sh` | `WTAI_export` | no | – | 2 h | `outputs/`, `outputs_resegment/` | `outputs_final/` + HF dataset |
@@ -36,7 +40,17 @@ Builds the spatial grid covering the Amazon (256 px tiles at 30 m, Landsat-8
 native resolution) and writes `tile_grid.parquet`. Run once; re-run only after
 changing the grid parameters in `src/config.py`.
 
-**Its output tells you the array size for step 01** — it prints the exact flag:
+It also runs `scripts/resolve_model_versions.py`, which resolves the current
+HEAD commit of both production HF Hub model repos, downloads both checkpoints
+once to warm the shared HF cache, and writes `model_versions.json` at the repo
+root. Every array task in step 01 reads that file and pulls the same pinned
+revision — resolved once per scan, not independently per task, so a model
+promoted mid-scan can't produce a run with mixed checkpoints. Unlike
+`tile_grid.parquet`, `model_versions.json` is meant to be regenerated on every
+scan, not kept — see [`reset.md`](../reset.md).
+
+**Its output tells you the array size for step 01** — it prints the exact flag,
+and (if you're not using `slurm/run_full_scan.sh`) you'd read it from here:
 
 ```
 Total tiles   : <n>
@@ -75,10 +89,14 @@ older run is migrated to the current header on open (old rows padded with empty
 fields, never re-run). See [`reset.md`](../reset.md) before re-running a scan
 over a directory that already holds one.
 
-Set `--array` to the range printed by step 00. The checkpoint and its encoder
-must match; `--segmenter-path`/`--backbone` in the script override the defaults
-in `src/config.py` (currently `segmenter.pth` / `vgg19_bn`). Dates default to
-the dry season, `2024-06-01`–`2024-09-30`.
+Set `--array` to the range printed by step 00 (`slurm/run_full_scan.sh` does
+this for you). By default the checkpoints come from the pinned HF pull —
+`model_versions.json`, written by step 00 — and the segmenter's encoder is
+auto-detected from the checkpoint, so there's no manual pairing to get wrong.
+To test a local experimental checkpoint instead, pass `--segmenter-path`/
+`--classifier-path` (and `--backbone` if that checkpoint has no embedded
+backbone) directly in the script, the same override pattern `resegment.py`
+uses. Dates default to the dry season, `2024-06-01`–`2024-09-30`.
 
 Needs GEE credentials: `gee-windthrowai-secret.json` in the repo root
 (or `--key-path`).
@@ -90,6 +108,12 @@ builds a VRT mosaic of the positive masks, and vectorises them to GeoJSON for
 QGIS. Prints the tile / positive / download-failure counts — worth reading, and
 required if you plan to re-segment (step 99 reads `all_results.csv`, and its
 array size derives from the positive count).
+
+Refuses to run if the number of `job_*/` directories doesn't match the
+expected job count from `tile_grid.parquet` — a guard against silently merging
+a run where an array task crashed. If that happens, check
+`slurm_logs/infer/` for the failed task(s) and resubmit them individually
+(`sbatch --array=<idx> slurm/01_inference_array.sh`) before merging again.
 
 ### 03 — Export to the frontend
 
@@ -195,27 +219,51 @@ which is the label set a retraining reads — and `review_summary_per_reviewer.c
 
 ## Full run
 
-Step 01 needs an `--array` range that is only known once step 00 has printed it,
-so the pipeline is not a single dependency chain end to end.
+```bash
+cd windthrowAI-amazon-scan
+slurm/run_full_scan.sh
+```
+
+This submits `00` and waits for it (~15 min — run it under `tmux`/`screen` or
+`nohup ... & disown` since an SSH drop during the wait aborts the whole chain
+before `01` is ever submitted), reads the resulting array size from
+`tile_grid.parquet`, then chains `01 → 02 → 03` via
+`sbatch --dependency=afterok:<jobid>` and returns immediately — SLURM carries
+the rest even if you log out. It prints every job id for `squeue -u $USER`.
+Starting a scan is still a deliberate, manual action; nothing triggers this
+automatically, including a new model being published in `windthrowAI-training`.
+
+`02` and `03` have `--kill-on-invalid-dep=yes` set, so if any `01` array task
+fails, the dependent jobs show up as `CANCELLED` in `squeue` instead of sitting
+silently `PENDING (DependencyNeverSatisfied)` forever.
+
+The optional re-segment step (99) is **not** part of this chain — it stays a
+manual, reviewed insertion between 02 and 03:
+
+```bash
+# after 02, read the positive count from slurm_logs/merge/*.out
+sbatch --array=0-120 slurm/99_resegment_array_optional.sh
+sbatch --dependency=afterok:<reseg_jobid> slurm/03_export_frontend.sh
+```
+
+### Running the steps by hand
+
+Equivalent to `run_full_scan.sh`, spelled out — useful for debugging or when
+you want to inspect step 00's output before committing to the array size:
 
 ```bash
 cd windthrowAI-amazon-scan
 
 sbatch slurm/00_generate_grid.sh
-# read the printed "--array=0-N" from slurm_logs/grid-*.out
+# read the printed "--array=0-N" from slurm_logs/grid/*.out
 
 sbatch --array=0-115 slurm/01_inference_array.sh
 sbatch --dependency=afterok:<infer_jobid> slurm/02_merge_results.sh
 sbatch --dependency=afterok:<merge_jobid> slurm/03_export_frontend.sh
 ```
 
-To swap in a new segmenter, insert the optional step before the export:
-
-```bash
-# after 02, read the positive count from slurm_logs/merge-*.out
-sbatch --array=0-120 slurm/99_resegment_array_optional.sh
-sbatch --dependency=afterok:<reseg_jobid> slurm/03_export_frontend.sh
-```
+(To swap in a new segmenter here, insert the optional step before the export —
+see the example under "Full run" above.)
 
 `--array` on the command line overrides the `#SBATCH --array` in the file, so
 the ranges can be set at submit time instead of editing the scripts.

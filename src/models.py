@@ -1,7 +1,7 @@
 """Model definitions and weight loading for the two-stage inference pipeline."""
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import segmentation_models_pytorch as smp
 import timm
@@ -117,12 +117,26 @@ def load_classifier(
 
 
 def load_segmenter(
-    path:          Path         = SEGMENTER_PTH,
-    device:        torch.device = torch.device("cuda"),
-    compile_model: bool         = False,
-    encoder_name:  str          = SEGMENTER_BACKBONE,
-) -> nn.Module:
+    path:          Path            = SEGMENTER_PTH,
+    device:        torch.device    = torch.device("cuda"),
+    compile_model: bool            = False,
+    encoder_name:  Optional[str]   = None,
+) -> Tuple[nn.Module, str]:
+    """
+    `encoder_name=None` (the default) auto-detects the smp encoder from the
+    checkpoint's "backbone" field — set by windthrowAI-training's
+    save_segmenter_checkpoint() — instead of requiring the caller to pass a
+    value that matches the checkpoint by hand. Pass an explicit encoder_name to
+    override (e.g. for a raw/legacy checkpoint with no embedded backbone).
+
+    Returns (model, resolved_encoder_name) so callers can log/record what was
+    actually used even when it was auto-detected.
+    """
     checkpoint = torch.load(path, map_location=device, weights_only=False)
+    resolved   = encoder_name or (
+        checkpoint.get("backbone", SEGMENTER_BACKBONE)
+        if isinstance(checkpoint, dict) else SEGMENTER_BACKBONE
+    )
     raw_state  = _unwrap_state_dict(checkpoint) if isinstance(checkpoint, dict) else checkpoint
 
     # Checkpoint was saved directly from smp.Unet (no WindthrowSegmenter wrapper),
@@ -130,10 +144,10 @@ def load_segmenter(
     if not any(k.startswith("unet.") for k in raw_state):
         raw_state = {"unet." + k: v for k, v in raw_state.items()}
 
-    model = WindthrowSegmenter(encoder_name=encoder_name)
+    model = WindthrowSegmenter(encoder_name=resolved)
     model.load_state_dict(raw_state)
     model.to(device).eval()
     model = _maybe_data_parallel(model, device)
     if compile_model:
         model = torch.compile(model, mode="reduce-overhead")
-    return model
+    return model, resolved

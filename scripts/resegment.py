@@ -76,7 +76,9 @@ def main():
     key_path = Path(args.key_path) if args.key_path else None
     init_gee(key_path=key_path)
 
-    segmenter = load_segmenter(args.segmenter_path, device, encoder_name=args.backbone)
+    segmenter, segmenter_backbone = load_segmenter(
+        args.segmenter_path, device, encoder_name=args.backbone
+    )
     print(f"[resegment {args.job_idx}] segmenter loaded: {args.segmenter_path.name}")
 
     df  = pd.read_csv(args.results_csv)
@@ -183,7 +185,7 @@ def main():
         "started_at":          started_at,
         "finished_at":         datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "segmenter_path":      str(args.segmenter_path),
-        "segmenter_backbone":  args.backbone,
+        "segmenter_backbone":  segmenter_backbone,
         "segmenter_threshold": args.seg_threshold,
         "source_results_csv":  str(args.results_csv),
         "chunk_size":          args.chunk_size,

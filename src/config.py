@@ -47,6 +47,19 @@ GEE_KEY_PATH = ROOT / "gee-windthrowai-secret.json"
 CLASSIFIER_PTH = MODELS_DIR / "classifier.pth"
 SEGMENTER_PTH  = MODELS_DIR / "segmenter.pth"
 
+# ── HF Hub model registry (mirrors windthrowAI-training/src/config.py) ─────
+# Duplicated rather than imported — these constants change far less often than
+# the pipeline code around them. Kept in sync by hand with the training repo
+# and with windthrowAI-classification-gradio / windthrowAI-segmentation-gradio.
+CLASSIFIER_REPO     = "alexKlg/windthrowAI-classifier"
+CLASSIFIER_FILENAME = "best_classifier_optimized.pth"
+SEGMENTER_REPO      = "alexKlg/windthrow-unet-positive-segmentation"
+SEGMENTER_FILENAME  = "unet_positiv_segmentation_best_model.pth"
+
+# Written once per scan by scripts/resolve_model_versions.py, pinning the exact
+# HF commit revision every array task in slurm/01_inference_array.sh must use.
+MODEL_VERSIONS_FILE = ROOT / "model_versions.json"
+
 # ── Inference ─────────────────────────────────────────────────────────────
 BATCH_SIZE    = 64
 TILES_PER_JOB = 2000

@@ -40,22 +40,21 @@ sys.path.insert(0, str(ROOT))
 
 from src.config import (
     BATCH_SIZE,
-    CLASSIFIER_PTH,
     CLASSIFIER_THRESHOLD,
     CLOUD_COVER_MAX,
     DATE_FROM,
     DATE_TO,
     GEE_KEY_PATH,
     GRID_FILE,
+    MODEL_VERSIONS_FILE,
     OUTPUTS_DIR,
     RESOLUTION_M,
-    SEGMENTER_BACKBONE,
-    SEGMENTER_PTH,
     SEGMENTER_THRESHOLD,
     TILE_SIZE_PX,
     TILES_PER_JOB,
 )
 from src.data import download_tile_with_meta, init_gee, preprocess, save_input, save_mask, save_prob_map
+from src.hub import download_checkpoint
 from src.models import load_classifier, load_segmenter
 from src.pipeline import classify_probs, segment_probs
 from src.results import base_row, fill_segmentation, open_results_csv
@@ -65,11 +64,16 @@ from src.tile_grid import get_job_tiles
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--job-idx",         type=int, required=True)
-    ap.add_argument("--classifier-path", type=Path, default=CLASSIFIER_PTH)
-    ap.add_argument("--segmenter-path",  type=Path, default=SEGMENTER_PTH)
-    ap.add_argument("--backbone",        default=SEGMENTER_BACKBONE,
+    ap.add_argument("--classifier-path", type=Path, default=None,
+                    help="local checkpoint override; default: pinned HF pull "
+                         "via model_versions.json (see resolve_model_versions.py)")
+    ap.add_argument("--segmenter-path",  type=Path, default=None,
+                    help="local checkpoint override; default: pinned HF pull "
+                         "via model_versions.json (see resolve_model_versions.py)")
+    ap.add_argument("--backbone",        default=None,
                     help="smp encoder name matching the segmenter checkpoint, "
-                         "e.g. resnet34, vgg19_bn")
+                         "e.g. resnet34, vgg19_bn — default: auto-detect from "
+                         "the checkpoint's embedded backbone field")
     ap.add_argument("--key-path",  default=None,
                     help=f"GEE service-account JSON (default: {GEE_KEY_PATH})")
     ap.add_argument("--date-from", default=None)
@@ -82,6 +86,46 @@ def parse_args():
     ap.add_argument("--no-prob-maps", action="store_true",
                     help="skip {tile_id}_prob.tif (loses post-hoc re-thresholding)")
     return ap.parse_args()
+
+
+def _resolve_checkpoint_paths(args):
+    """
+    Fill in --classifier-path/--segmenter-path from the pinned HF versions file
+    when either is not given explicitly on the command line. An explicit path
+    always wins (today's manual-override workflow for testing an unpublished
+    candidate checkpoint, unchanged).
+
+    Returns (classifier_path, segmenter_path, revisions) where `revisions` is
+    {"classifier_revision": ..., "segmenter_revision": ...} for provenance —
+    None for whichever side used an explicit local override.
+    """
+    if args.classifier_path is not None and args.segmenter_path is not None:
+        return args.classifier_path, args.segmenter_path, {
+            "classifier_revision": None,
+            "segmenter_revision":  None,
+        }
+
+    if not MODEL_VERSIONS_FILE.exists():
+        sys.exit(
+            "No --classifier-path/--segmenter-path given and "
+            f"{MODEL_VERSIONS_FILE.name} is missing. Run "
+            "scripts/resolve_model_versions.py first (or use "
+            "slurm/run_full_scan.sh, which does this automatically)."
+        )
+    versions = json.loads(MODEL_VERSIONS_FILE.read_text())
+
+    classifier_path = args.classifier_path or download_checkpoint(
+        versions["classifier"]["repo_id"], versions["classifier"]["filename"],
+        versions["classifier"]["revision"], local_files_only=True,
+    )
+    segmenter_path = args.segmenter_path or download_checkpoint(
+        versions["segmenter"]["repo_id"], versions["segmenter"]["filename"],
+        versions["segmenter"]["revision"], local_files_only=True,
+    )
+    return classifier_path, segmenter_path, {
+        "classifier_revision": None if args.classifier_path else versions["classifier"]["revision"],
+        "segmenter_revision":  None if args.segmenter_path  else versions["segmenter"]["revision"],
+    }
 
 
 def _git_commit() -> str:
@@ -100,16 +144,20 @@ def main():
     n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
     print(f"[job {args.job_idx}] device={device}  GPUs={n_gpus}")
 
+    classifier_path, segmenter_path, revisions = _resolve_checkpoint_paths(args)
+
     key_path = Path(args.key_path) if args.key_path else None
     init_gee(key_path=key_path)
     print(f"[job {args.job_idx}] GEE initialised")
 
-    classifier = load_classifier(args.classifier_path, device)
-    segmenter  = load_segmenter(args.segmenter_path, device, encoder_name=args.backbone)
+    classifier = load_classifier(classifier_path, device)
+    segmenter, segmenter_backbone = load_segmenter(
+        segmenter_path, device, encoder_name=args.backbone
+    )
     print(
         f"[job {args.job_idx}] Models loaded – "
-        f"classifier: {args.classifier_path.name}, "
-        f"segmenter: {args.segmenter_path.name} ({args.backbone})"
+        f"classifier: {classifier_path.name}, "
+        f"segmenter: {segmenter_path.name} ({segmenter_backbone})"
     )
 
     tiles   = get_job_tiles(GRID_FILE, args.job_idx, TILES_PER_JOB)
@@ -241,9 +289,11 @@ def main():
         "job_idx":              args.job_idx,
         "started_at":           started_at,
         "finished_at":          datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "classifier_path":      str(args.classifier_path),
-        "segmenter_path":       str(args.segmenter_path),
-        "segmenter_backbone":   args.backbone,
+        "classifier_path":      str(classifier_path),
+        "segmenter_path":       str(segmenter_path),
+        "segmenter_backbone":   segmenter_backbone,
+        "classifier_revision":  revisions["classifier_revision"],
+        "segmenter_revision":   revisions["segmenter_revision"],
         "classifier_threshold": args.clf_threshold,
         "segmenter_threshold":  args.seg_threshold,
         "date_from":            args.date_from or DATE_FROM,

@@ -3,6 +3,7 @@ outputs_resegment/
 # HF snapshot cache of summarize_reviews.py (the CSVs next to it are kept)
 outputs_final/reviews/download/
 tile_grid.parquet
+model_versions.json
 slurm_logs/
 models/*.pth
 gee-windthrowai-secret.json

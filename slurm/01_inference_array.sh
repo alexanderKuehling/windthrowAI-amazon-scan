@@ -11,6 +11,7 @@
 #SBATCH --array=0-115          # adjust 
 #SBATCH --mail-type=FAIL
 
+set -euo pipefail
 
 mkdir -p slurm_logs
 
@@ -22,11 +23,12 @@ source $CONDA_BASE/etc/profile.d/conda.sh
 conda activate windthrowEnv
 
 
-# --segmenter-path / --backbone must match each other; defaults come from
-# src/config.py (SEGMENTER_PTH, SEGMENTER_BACKBONE).
- python -u scripts/run_inference.py \
+# Default: pull the checkpoints pinned in model_versions.json (written by
+# resolve_model_versions.py in slurm/00_generate_grid.sh) — the backbone is
+# auto-detected from the checkpoint, no manual pairing needed. To test a local
+# experimental checkpoint instead, pass --segmenter-path/--classifier-path
+# (and --backbone if the checkpoint has none embedded), same as resegment.py.
+python -u scripts/run_inference.py \
     --job-idx "$SLURM_ARRAY_TASK_ID" \
-    --segmenter-path models/segmenter_v2.pth \
-    --backbone resnet34 \
     --date-from "2024-06-01" \
     --date-to   "2024-09-30"

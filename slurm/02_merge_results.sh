@@ -7,6 +7,9 @@
 #SBATCH --job-name=WTAI_merge
 #SBATCH --output=slurm_logs/merge/%j.out
 #SBATCH --error=slurm_logs/merge/%j.err
+#SBATCH --kill-on-invalid-dep=yes
+
+set -euo pipefail
 
 mkdir -p slurm_logs
 
