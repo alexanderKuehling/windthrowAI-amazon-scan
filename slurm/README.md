@@ -29,7 +29,7 @@ To re-run a scan from scratch, clear the previous one first —
 | 00 | `00_generate_grid.sh` | `WTAI_grid` | no | – | 15 min | `src/config.py`, HF model repos | `tile_grid.parquet`, `model_versions.json` |
 | 01 | `01_inference_array.sh` | `WTAI_infer` | 2×A100 | yes | 4 h | `tile_grid.parquet` | `outputs/job_*/` |
 | 02 | `02_merge_results.sh` | `WTAI_merge` | no | – | 1 h | `outputs/job_*/results.csv` | `outputs/all_results.csv`, `.vrt`, `.geojson` |
-| 03 | `03_export_frontend.sh` | `WTAI_export` | no | – | 2 h | `outputs/`, `outputs_resegment/` | `outputs_final/` + HF dataset |
+| 03 | `03_export_frontend.sh` | `WTAI_export` | no | – | 6 h | `outputs/`, `outputs_resegment/` | `outputs_final/` + HF dataset |
 | 99 | `99_resegment_array_optional.sh` | `WTAI_reseg` | 2×A100 | yes | 2 h | `outputs/all_results.csv` | `outputs_resegment/job_*/` |
 | 99 | `99_recompress_hf_inputs_one_time.sh` | `WTAI_recompress` | no | – | 3 h | HF dataset `inputs/` | HF dataset `inputs/` |
 | 99 | `99_summarize_reviews.sh` | `WTAI_reviewstats` | no | – | 30 min | HF dataset `reviews/` | `outputs_final/reviews/*.csv` |
@@ -162,12 +162,14 @@ masks → probs → `scan_meta.json` → `inputs_index.csv` *last*, because the
 index is what makes a tile visible to the Expert-Review tab — it must not go
 up before that tile's imagery and mask are already there.
 
-The script passes only `--skip-tiles`, so every rescan refreshes the GeoJSON,
-the index, `inputs/` and `masks/`: new positive tiles get their review imagery
-and reviewers never 404 on `inputs/{tile}.tif`. `--skip-tiles` is permanent
-(decision D3): `tiles/` is the map overlay of
-`windthrowAI-segmentation-FE-hosting`, which the review/retrain loop doesn't
-serve, and gdal2tiles over z5–13 is the expensive part of a run.
+The script runs the full export: every rescan refreshes the GeoJSON, the map
+overlay (`tiles/`), the index, `inputs/` and `masks/`, so new positive tiles
+get their review imagery and reviewers never 404 on `inputs/{tile}.tif`.
+`tiles/` is mirrored, not just added to: remote tiles the new scan no longer
+produces are deleted in the same commit, so a detection the new model dropped
+disappears from the map too. gdal2tiles over z5–13 is the slow part, hence the
+6 h walltime; pass `--skip-tiles` by hand for a quick run that leaves the map
+as it is.
 
 `inputs_index.csv` is *not* tied to `--skip-inputs`: it is one small file, it
 carries every per-tile score the review UI filters on, and skipping the bulk

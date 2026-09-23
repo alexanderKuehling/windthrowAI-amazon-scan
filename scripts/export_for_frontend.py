@@ -461,6 +461,15 @@ def write_scan_meta(scan_id: str, n_positive_tiles: int) -> None:
 # must go up only after that tile's imagery and mask are already there —
 # otherwise a reviewer can briefly see a new tile with no image, or an old
 # mask under a refreshed index (F7 in AUTOMATION_PLAN.md).
+# Remote folders mirrored exactly, not just added to: remote files the local
+# folder no longer has are deleted in the same commit (scoped to that folder).
+# tiles/ needs it because gdal2tiles -x writes no tile where a scan found
+# nothing, so without it a detection the new model dropped would stay on the
+# map forever. inputs/ and masks/ don't: a tile missing from inputs_index.csv
+# is already invisible to reviewers.
+MIRRORED_FOLDERS = {"tiles"}
+
+
 def _upload_plan(args):
     """[(local_path, path_in_repo, enabled, is_folder), ...] in upload order.
     Shared by upload_to_hf (real) and print_upload_plan (--dry-run) so the two
@@ -486,9 +495,11 @@ def upload_to_hf(repo_id: str, args):
         if not enabled or not path.exists():
             continue
         if is_folder:
+            mirrored = path_in_repo in MIRRORED_FOLDERS
             api.upload_folder(folder_path=str(path), path_in_repo=path_in_repo,
-                               repo_id=repo_id, repo_type="dataset")
-            print(f"  uploaded {path_in_repo}/")
+                               repo_id=repo_id, repo_type="dataset",
+                               delete_patterns="*" if mirrored else None)
+            print(f"  uploaded {path_in_repo}/" + (" (stale remote files removed)" if mirrored else ""))
         else:
             api.upload_file(path_or_fileobj=str(path), path_in_repo=path_in_repo,
                              repo_id=repo_id, repo_type="dataset")
@@ -517,7 +528,8 @@ def print_upload_plan(args, scan_id: str):
             continue
         if is_folder:
             n = sum(1 for p in path.rglob("*") if p.is_file())
-            print(f"  [dry-run] would upload {path_in_repo}/  ({n} file(s))")
+            mirror = ", deleting remote files not in it" if path_in_repo in MIRRORED_FOLDERS else ""
+            print(f"  [dry-run] would upload {path_in_repo}/  ({n} file(s){mirror})")
         else:
             print(f"  [dry-run] would upload {path_in_repo}")
 
