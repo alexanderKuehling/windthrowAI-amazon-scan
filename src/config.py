@@ -30,11 +30,16 @@ NORM_P95 = np.array([0.063285, 0.0722225, 0.0521475, 0.355225,
                       0.191545, 0.0954875, 0.7648977],  dtype=np.float32)
 
 # ── Models ────────────────────────────────────────────────────────────────
-CLASSIFIER_BACKBONE  = "mobilenetv3_small_100"
+# Backbones are fallbacks only — load_classifier/load_segmenter read the
+# checkpoint's own "backbone" field first. They match what is live: the
+# classifier embeds efficientnet_b0; the segmenter repo below holds a bare
+# smp.Unet(resnet34) state_dict with no backbone embedded, so this fallback is
+# what makes the pinned HF pull in step 01 load it.
+CLASSIFIER_BACKBONE  = "efficientnet_b0"
 CLASSIFIER_DROPOUT   = 0.2
 CLASSIFIER_THRESHOLD = 0.5
 
-SEGMENTER_BACKBONE  = "vgg19_bn"
+SEGMENTER_BACKBONE  = "resnet34"
 SEGMENTER_THRESHOLD = 0.5
 
 # ── Paths ─────────────────────────────────────────────────────────────────
@@ -53,8 +58,8 @@ SEGMENTER_PTH  = MODELS_DIR / "segmenter.pth"
 # and with windthrowAI-classification-gradio / windthrowAI-segmentation-gradio.
 CLASSIFIER_REPO     = "alexKlg/windthrowAI-classifier"
 CLASSIFIER_FILENAME = "best_classifier_optimized.pth"
-SEGMENTER_REPO      = "alexKlg/windthrow-unet-positive-segmentation"
-SEGMENTER_FILENAME  = "unet_positiv_segmentation_best_model.pth"
+SEGMENTER_REPO      = "alexKlg/windthrow-unet-classifier-pretrained"   # decision D1
+SEGMENTER_FILENAME  = "best_unet_classifier_pretrained_seg.pth"
 
 # Written once per scan by scripts/resolve_model_versions.py, pinning the exact
 # HF commit revision every array task in slurm/01_inference_array.sh must use.

@@ -132,8 +132,8 @@ sbatch --dependency=afterok:<merge_jobid> slurm/03_export_frontend.sh
 
 Check `slurm/README.md` for the full pipeline, and confirm before submitting
 step 03 that its flags are the ones you want. By default it now only passes
-`--skip-tiles` (skips the map overlay; see decision D3 in
-`../AUTOMATION_PLAN.md` for why it stays on) — every rescan otherwise
+`--skip-tiles` (skips the map overlay of segmentation-FE-hosting, which the
+review loop doesn't need — decision D3) — every rescan otherwise
 publishes fresh review imagery, since `--skip-inputs` was removed from the
 default call (a new positive tile needs `inputs/{tile}.tif` or the
 Expert-Review tab 404s on it). Pass `--skip-inputs` yourself if you

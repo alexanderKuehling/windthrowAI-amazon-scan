@@ -162,15 +162,12 @@ masks → probs → `scan_meta.json` → `inputs_index.csv` *last*, because the
 index is what makes a tile visible to the Expert-Review tab — it must not go
 up before that tile's imagery and mask are already there.
 
-The script now passes only `--skip-tiles` by default, so every rescan
-refreshes the GeoJSON, the index, `inputs/` and `masks/` — new positive tiles
-get their review imagery and reviewers never 404 on `inputs/{tile}.tif` (F7 in
-AUTOMATION_PLAN.md). `--skip-tiles` stays because whether the map overlay
-(used by `windthrowAI-segmentation-FE-hosting`) should update on every scan is
-still open — decision D3 in AUTOMATION_PLAN.md; the script has a comment at
-that flag pointing here. `--skip-tiles` is also the expensive part of a run
-(gdal2tiles over z5–13), so leaving it on keeps a routine rescan cheap in the
-meantime.
+The script passes only `--skip-tiles`, so every rescan refreshes the GeoJSON,
+the index, `inputs/` and `masks/`: new positive tiles get their review imagery
+and reviewers never 404 on `inputs/{tile}.tif`. `--skip-tiles` is permanent
+(decision D3): `tiles/` is the map overlay of
+`windthrowAI-segmentation-FE-hosting`, which the review/retrain loop doesn't
+serve, and gdal2tiles over z5–13 is the expensive part of a run.
 
 `inputs_index.csv` is *not* tied to `--skip-inputs`: it is one small file, it
 carries every per-tile score the review UI filters on, and skipping the bulk
