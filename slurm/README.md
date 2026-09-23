@@ -69,6 +69,10 @@ Engine, runs the classifier, and segments the tiles it flags positive.
 Per task: `outputs/job_{idx:04d}/results.csv` and `run_meta.json`, plus
 `{tile_id}_mask.tif`, `{tile_id}_input.tif` (the 7-band model input) and
 `{tile_id}_prob.tif` (the segmenter probability map) for positive tiles only.
+A fixed ~0.5% sample of the tiles the classifier **rejects** also keeps its
+`{tile_id}_input.tif` (`is_control=True`; hash-chosen, only tiles at least 80%
+cloud-free, see `CONTROL_*` in `src/config.py`). Those are the review spot
+checks, the only way reviewers ever see what the model misses.
 
 `results.csv` records the model's **scores**, not just its decisions — see
 `src/results.py` for the column list:
@@ -136,11 +140,15 @@ dataset `alexKlg/windthrowAI-dataset-segmentation_results`:
 - `inputs_index.csv` — the tile list the Expert-Review tab reads: `tile_id` →
   bbox plus the per-tile scores from `results.csv` (`coverage`, `clf_prob`,
   `seg_mean_prob_in_mask`, `seg_max_prob`, `valid_frac`, `n_scenes`,
-  `date_first`, `date_last`, `cloud_mean`, `source`, `scan_id`)
-- `masks/` — per-tile proposed mask (Expert-Review tab)
+  `date_first`, `date_last`, `cloud_mean`, `source`, `kind`, `scan_id`).
+  `kind` is `flagged` for detections, `control` for spot-check tiles
+- `masks/` — per-tile proposed mask (Expert-Review tab); all-zero for spot checks
 - `probs/` — per-tile segmenter probability map, only with `--include-probs`
 - `scan_meta.json` — this export's `scan_id`, timestamp, pinned model
-  provenance and positive-tile count (repo root)
+  provenance, positive-tile and spot-check counts (repo root)
+
+Spot-check tiles get review imagery and an empty mask but stay out of
+`windthrow.geojson` and `tiles/`: the map shows detections only.
 
 The masks come from `outputs/`, overridden per tile by `outputs_resegment/`
 where step 99 has produced one. With no re-segmentation, the original masks are

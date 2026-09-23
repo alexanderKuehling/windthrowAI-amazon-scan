@@ -13,8 +13,13 @@ Outputs per job:
     outputs/job_{job_idx:04d}/results.csv         – metadata + scores per tile
     outputs/job_{job_idx:04d}/run_meta.json       – checkpoints, thresholds, dates
     outputs/job_{job_idx:04d}/{tile_id}_mask.tif  – mask for positive tiles only
-    outputs/job_{job_idx:04d}/{tile_id}_input.tif – model input for positive tiles
+    outputs/job_{job_idx:04d}/{tile_id}_input.tif – model input for positive tiles,
+                                                    and for rejected spot-check tiles
     outputs/job_{job_idx:04d}/{tile_id}_prob.tif  – segmenter probability map
+
+A small fixed sample of the tiles the classifier *rejects* keeps its input too
+(is_control=True, see src/results.py::is_control_sample): the export publishes
+them as review spot checks, the only way reviewers ever see what the model misses.
 
 results.csv records the model's *scores*, not just its decisions: `clf_prob` for
 every downloaded tile (including negatives) and the segmenter probability map for
@@ -57,7 +62,7 @@ from src.data import download_tile_with_meta, init_gee, preprocess, save_input, 
 from src.hub import download_checkpoint
 from src.models import load_classifier, load_segmenter
 from src.pipeline import classify_probs, segment_probs
-from src.results import base_row, fill_segmentation, open_results_csv
+from src.results import base_row, fill_segmentation, is_control_sample, open_results_csv
 from src.tile_grid import get_job_tiles
 
 
@@ -217,6 +222,7 @@ def main():
 
     t_gpu_start = time.perf_counter()
     n_pos = 0
+    n_control = 0
     for start_i in range(0, len(pending_arrays), effective_bs):
         sl           = slice(start_i, start_i + effective_bs)
         batch_ids    = pending_ids[sl]
@@ -267,6 +273,12 @@ def main():
                     record["prob_path"] = str(pp.relative_to(ROOT))
 
                 fill_segmentation(record, prob, mask)
+            elif not pos and is_control_sample(tile_id, meta.get("valid_frac")):
+                n_control += 1
+                ip = out_dir / f"{tile_id}_input.tif"
+                save_input(raw, bbox, ip)
+                record["input_path"] = str(ip.relative_to(ROOT))
+                record["is_control"] = True
             writer.writerow(record)
         csv_file.flush()
 
@@ -279,7 +291,7 @@ def main():
     csv_file.close()
 
     total = len(pending_arrays)
-    print(f"[job {args.job_idx}] positives: {n_pos}/{total}")
+    print(f"[job {args.job_idx}] positives: {n_pos}/{total}  spot-check tiles: {n_control}")
 
     # ── Run provenance ────────────────────────────────────────────────────
     # Which checkpoints and thresholds produced this job's rows, recorded next to
@@ -305,6 +317,7 @@ def main():
         "n_tiles_processed":    total,
         "n_download_failed":    len(failed_rows),
         "n_positive":           n_pos,
+        "n_control":            n_control,
         "git_commit":           _git_commit(),
         "host":                 platform.node(),
     }, indent=2))

@@ -7,8 +7,11 @@ models — it is written even for tiles the run rejects.
 """
 
 import csv
+import hashlib
 from pathlib import Path
 from typing import Optional, Tuple
+
+from src.config import CONTROL_MIN_VALID_FRAC, CONTROL_SAMPLE_RATE
 
 CSV_COLUMNS = [
     "tile_id", "lon_min", "lat_min", "lon_max", "lat_max",
@@ -19,7 +22,26 @@ CSV_COLUMNS = [
     "coverage", "mask_pixels",  # extent of the proposed mask
     "seg_mean_prob", "seg_mean_prob_in_mask", "seg_max_prob",  # stage-2 confidence
     "prob_path",                # segmenter probability map (uint8, DN/255)
+    "is_control",               # rejected tile exported as a review spot check
 ]
+
+
+def is_control_sample(tile_id: str, valid_frac) -> bool:
+    """Whether a tile the classifier rejected is one of the review spot checks.
+
+    Chosen by a hash of the tile id, so it is deterministic (the same tiles in
+    every scan, and a resumed job agrees with itself) and independent of the
+    model. The "control:" salt keeps it uncorrelated with windthrowAI-training's
+    train/val/test split, which hashes the bare tile id: unsalted, every control
+    tile would land in the test split. Tiles mostly hidden by cloud are left out,
+    since a reviewer couldn't judge them."""
+    try:
+        if float(valid_frac) < CONTROL_MIN_VALID_FRAC:
+            return False
+    except (TypeError, ValueError):
+        return False
+    digest = hashlib.md5(f"control:{tile_id}".encode()).hexdigest()
+    return int(digest[:8], 16) / 0xFFFFFFFF < CONTROL_SAMPLE_RATE
 
 
 def open_results_csv(path: Path) -> Tuple:
@@ -86,6 +108,7 @@ def base_row(
         "seg_mean_prob_in_mask": "",
         "seg_max_prob":  "",
         "prob_path":     "",
+        "is_control":    False,
     }
 
 

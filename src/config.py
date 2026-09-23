@@ -69,5 +69,15 @@ MODEL_VERSIONS_FILE = ROOT / "model_versions.json"
 BATCH_SIZE    = 64
 TILES_PER_JOB = 2000
 
+# ── Spot-check sample ("control" tiles) ───────────────────────────────────
+# Reviewers otherwise only ever see tiles the classifier flagged, so its misses
+# and any drift toward flagging plain forest stay invisible. A fixed random
+# share of the tiles it *rejects* is exported with an empty mask and mixed into
+# review (see src/results.py::is_control_sample). Only tiles clear enough to
+# judge qualify. ~0.5% of rejected tiles is a few hundred per Amazon scan —
+# plenty, as the review app shows one about every 10th tile.
+CONTROL_SAMPLE_RATE    = 0.005
+CONTROL_MIN_VALID_FRAC = 0.8
+
 # ── GEE ───────────────────────────────────────────────────────────────────
 GEE_PROJECT = "gee-windthrowai"

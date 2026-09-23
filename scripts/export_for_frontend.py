@@ -22,7 +22,12 @@ Steps:
      (masks/{tile_id}.tif), aligned to inputs/{tile_id}.tif, for the Expert-Review tab.
   7. Optionally (--include-probs) stage the segmenter probability maps as
      probs/{tile_id}.tif (uint8, probability = DN/255).
-  8. Write scan_meta.json (model provenance + tile count for this export).
+  8. Write scan_meta.json (model provenance + tile counts for this export).
+
+Steps 4-6 also cover the spot-check tiles: rejected tiles run_inference kept an
+input for (is_control). They get an all-zero mask and `kind=control` in the
+index, and stay out of the GeoJSON and the map (steps 2-3), which show
+detections only. Every other index row is `kind=flagged`.
   9. Upload, in an order a reviewer can safely browse mid-upload: geojson ->
      tiles -> inputs -> masks -> probs -> scan_meta.json -> inputs_index.csv
      *last* (AUTOMATION_PLAN.md contract 4.2/4.3, ticket T2/T8). The index is
@@ -253,7 +258,37 @@ def collect_final_results() -> dict:
             else:
                 final.pop(tile_id, None)  # re-segmented and rejected
 
+    for entry in final.values():
+        entry["kind"] = "flagged"
     return final
+
+
+def collect_control_tiles(final: dict) -> dict:
+    """tile_id -> entry for every spot-check tile of the original run: a tile the
+    classifier rejected whose input run_inference kept (is_control, see
+    src/results.py::is_control_sample). No mask on disk — the proposed mask is
+    empty by definition. A tile that is also in `final` (positive after all,
+    e.g. a resumed job) is a detection, not a control."""
+    controls = {}
+    for csv_path in sorted(ORIG_DIR.glob("job_*/results.csv")):
+        df = _read_results_csv(csv_path)
+        if "is_control" not in df.columns:
+            continue   # a run from before spot checks existed
+        for _, row in df.iterrows():
+            tile_id = row["tile_id"]
+            if tile_id in final or not _is_true(row.get("is_control")) or not _nonempty(row.get("input_path")):
+                continue
+            input_path = ROOT / str(row["input_path"]).strip()
+            if not input_path.exists():
+                continue
+            metrics = _metrics(row)
+            metrics["coverage"] = "0"
+            controls[tile_id] = {
+                "mask_path": None, "input_path": input_path, "prob_path": None,
+                "bbox": tuple(float(row[c]) for c in ("lon_min", "lat_min", "lon_max", "lat_max")),
+                "metrics": metrics, "source": "scan", "kind": "control",
+            }
+    return controls
 
 
 def export_geojson(mask_paths: list):
@@ -358,6 +393,7 @@ def export_index(results: dict, scan_id: str):
             "lon_max": lon_max, "lat_max": lat_max,
             **{col: metrics.get(col, "") for col in METRIC_COLUMNS},
             "source": r.get("source", ""),
+            "kind": r.get("kind", "flagged"),
             "scan_id": scan_id,
         })
 
@@ -389,13 +425,24 @@ def export_masks(results: dict):
     """Stage each positive tile's proposed mask as masks/{tile_id}.tif — a single-band
     uint8 (0/1) GeoTIFF on the same grid as inputs/{tile_id}.tif, so the Expert-Review
     tab can load a per-pixel-editable proposed mask that lines up with the input imagery."""
-    entries = [(tid, r) for tid, r in results.items() if r["mask_path"] and r["mask_path"].exists()]
+    entries = [
+        (tid, r) for tid, r in results.items()
+        if (r["mask_path"] and r["mask_path"].exists())
+        or (r.get("kind") == "control" and r["input_path"] and r["input_path"].exists())
+    ]
     print(f"Staging {len(entries)} mask GeoTIFFs ...")
     MASKS_DIR.mkdir(parents=True, exist_ok=True)
     for tile_id, r in entries:
-        with rasterio.open(r["mask_path"]) as src:
-            mask    = (src.read(1) > 0).astype("uint8")
-            profile = src.profile
+        if r["mask_path"]:
+            with rasterio.open(r["mask_path"]) as src:
+                mask    = (src.read(1) > 0).astype("uint8")
+                profile = src.profile
+        else:
+            # Spot check: the model proposes nothing, so an all-zero mask on the
+            # input's own grid — the review tab loads it like any other.
+            with rasterio.open(r["input_path"]) as src:
+                mask    = np.zeros((src.height, src.width), dtype="uint8")
+                profile = src.profile
         profile.update(count=1, dtype="uint8", nodata=None, compress="deflate")
         with rasterio.open(MASKS_DIR / f"{tile_id}.tif", "w", **profile) as dst:
             dst.write(mask, 1)
@@ -439,7 +486,7 @@ def _model_block() -> dict:
     return {"classifier": classifier_block, "segmenter": segmenter_block}
 
 
-def write_scan_meta(scan_id: str, n_positive_tiles: int) -> None:
+def write_scan_meta(scan_id: str, n_positive_tiles: int, n_control_tiles: int = 0) -> None:
     """Write scan_meta.json at the export root (contract 4.3): which pinned
     models produced this scan_id, and how many positive tiles it carries, so a
     downstream reader (training's manifest, a human comparing rounds) doesn't
@@ -449,6 +496,7 @@ def write_scan_meta(scan_id: str, n_positive_tiles: int) -> None:
         "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         **_model_block(),
         "n_positive_tiles": n_positive_tiles,
+        "n_control_tiles": n_control_tiles,
     }
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     SCAN_META_PATH.write_text(json.dumps(meta, indent=2))
@@ -547,20 +595,23 @@ def main():
     final_results = collect_final_results()
     print(f"Final mask count (resegmented overrides original): {len(final_results)}")
     mask_paths = [r["mask_path"] for r in final_results.values()]
+    controls = collect_control_tiles(final_results)
+    print(f"Spot-check tiles (rejected, sampled for review): {len(controls)}")
+    reviewable = {**final_results, **controls}   # the map and GeoJSON stay detections-only
 
     export_geojson(mask_paths)
     if not args.skip_tiles:
         export_tiles(mask_paths, args.zoom)
     if not args.skip_inputs:
-        export_inputs(final_results)
+        export_inputs(reviewable)
     if not args.skip_index:
-        export_index(final_results, scan_id)
+        export_index(reviewable, scan_id)
     if not args.skip_masks:
-        export_masks(final_results)
+        export_masks(reviewable)
     if args.include_probs:
         export_probs(final_results)
 
-    write_scan_meta(scan_id, len(final_results))
+    write_scan_meta(scan_id, len(final_results), len(controls))
 
     if args.dry_run:
         print_upload_plan(args, scan_id)

@@ -56,7 +56,8 @@ def _published_positive_count(repo_id: str) -> Optional[int]:
         path = hf_hub_download(repo_id=repo_id, repo_type="dataset",
                                 filename="inputs_index.csv", token=token)
         with open(path, newline="") as f:
-            return sum(1 for _ in csv.DictReader(f))
+            # spot-check rows (kind=control) are rejected tiles, not detections
+            return sum(1 for r in csv.DictReader(f) if r.get("kind") != "control")
     except Exception as exc:  # noqa: BLE001 — this check is best-effort only
         print(f"  (could not fetch previous inputs_index.csv for comparison: {exc})")
         return None
