@@ -1,5 +1,7 @@
 # SLURM pipeline
 
+> Operating the review → retrain → rescan loop: see [`LOOP.md`](../../LOOP.md) (lives next to the repos, outside git).
+
 Amazon-wide windthrow scan, from an empty repo to the Hugging Face dataset the
 frontends read. Submit every job **from the repo root** — the scripts use paths
 relative to it (`scripts/`, `outputs/`, `slurm_logs/`):
@@ -115,6 +117,14 @@ a run where an array task crashed. If that happens, check
 `slurm_logs/infer/` for the failed task(s) and resubmit them individually
 (`sbatch --array=<idx> slurm/01_inference_array.sh`) before merging again.
 
+At the end it also prints `positives: <old> → <new> (Δ%)`, a best-effort
+comparison of this run's positive count against the `inputs_index.csv`
+currently published on HF, with a loud warning if it moved by more than 50% —
+the only guard against a classifier that got fine-tuned into flagging almost
+everything. Advisory only: it never blocks the merge, and if the previous
+index can't be downloaded (offline, no prior export, no token) it just prints
+a note and skips the comparison.
+
 ### 03 — Export to the frontend
 
 Builds the final artefacts in `outputs_final/` and uploads them to the HF
@@ -126,9 +136,11 @@ dataset `alexKlg/windthrowAI-dataset-segmentation_results`:
 - `inputs_index.csv` — the tile list the Expert-Review tab reads: `tile_id` →
   bbox plus the per-tile scores from `results.csv` (`coverage`, `clf_prob`,
   `seg_mean_prob_in_mask`, `seg_max_prob`, `valid_frac`, `n_scenes`,
-  `date_first`, `date_last`, `cloud_mean`, `source`)
+  `date_first`, `date_last`, `cloud_mean`, `source`, `scan_id`)
 - `masks/` — per-tile proposed mask (Expert-Review tab)
 - `probs/` — per-tile segmenter probability map, only with `--include-probs`
+- `scan_meta.json` — this export's `scan_id`, timestamp, pinned model
+  provenance and positive-tile count (repo root)
 
 The masks come from `outputs/`, overridden per tile by `outputs_resegment/`
 where step 99 has produced one. With no re-segmentation, the original masks are
@@ -136,14 +148,39 @@ exported unchanged. `source` in the index records which of the two a tile came
 from; re-segmented tiles keep the `clf_prob` from the original scan, since
 step 99 never re-runs the classifier.
 
-The script currently passes `--skip-tiles --skip-inputs`, i.e. it refreshes only
-the GeoJSON, the index and the masks. **Drop those flags to publish a full
-result set.** `--skip-tiles` is the expensive one (gdal2tiles over z5–13).
+Every export is stamped with a `scan_id` (`scan-YYYYMMDDTHHMMSSZ`, UTC of the
+export — see AUTOMATION_PLAN.md contract 4.1, or override with `--scan-id`).
+It lands as the last column of `inputs_index.csv`, in `scan_meta.json`, and —
+once every upload above has succeeded — as a git tag on the dataset repo
+(`revision=scan_id` then reproduces exactly the inputs/masks reviewers saw;
+skip the tag with `--no-tag`). **Reviews submitted from that point on belong
+to that round**: the frontend reads the tagged `scan_id` off the index and
+attaches it to every review it submits (see T3 in AUTOMATION_PLAN.md).
+
+Upload order matters and is not configurable: geojson → tiles → inputs →
+masks → probs → `scan_meta.json` → `inputs_index.csv` *last*, because the
+index is what makes a tile visible to the Expert-Review tab — it must not go
+up before that tile's imagery and mask are already there.
+
+The script now passes only `--skip-tiles` by default, so every rescan
+refreshes the GeoJSON, the index, `inputs/` and `masks/` — new positive tiles
+get their review imagery and reviewers never 404 on `inputs/{tile}.tif` (F7 in
+AUTOMATION_PLAN.md). `--skip-tiles` stays because whether the map overlay
+(used by `windthrowAI-segmentation-FE-hosting`) should update on every scan is
+still open — decision D3 in AUTOMATION_PLAN.md; the script has a comment at
+that flag pointing here. `--skip-tiles` is also the expensive part of a run
+(gdal2tiles over z5–13), so leaving it on keeps a routine rescan cheap in the
+meantime.
 
 `inputs_index.csv` is *not* tied to `--skip-inputs`: it is one small file, it
 carries every per-tile score the review UI filters on, and skipping the bulk
 input rasters is no reason to leave it stale. Use `--skip-index` to suppress it
 explicitly.
+
+`--dry-run` runs every export step and writes the local files, but skips the
+HF upload and the tag, printing the upload plan instead — the only mode safe
+to run without write access, and the one an agent verifying this pipeline
+should use.
 
 Needs `gdalbuildvrt` + `gdal2tiles.py` on PATH, and HF write access:
 `huggingface-cli login` on the cluster, or `HF_TOKEN` exported before submitting.

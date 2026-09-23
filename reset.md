@@ -15,7 +15,7 @@ cd windthrowAI-amazon-scan
 | `outputs/` | 01 inference — `job_*/results.csv`, `run_meta.json`, `*_mask.tif`, `*_input.tif`, `*_prob.tif` | **yes** |
 | `outputs/all_results.csv`, `*.vrt`, `*.geojson` | 02 merge | yes (inside `outputs/`) |
 | `outputs_resegment/` | 99 re-segmentation | **yes** |
-| `outputs_final/` | 03 export staging — `tiles/`, `inputs/`, `masks/`, `probs/`, `inputs_index.csv` | **yes** |
+| `outputs_final/` | 03 export staging — `tiles/`, `inputs/`, `masks/`, `probs/`, `inputs_index.csv`, `scan_meta.json` | **yes** |
 | `slurm_logs/` | every job | optional |
 | `src/__pycache__`, `scripts/__pycache__` | Python | optional |
 | `tile_grid.parquet` | 00 generate grid | **no** — see below |
@@ -131,5 +131,12 @@ sbatch --dependency=afterok:<merge_jobid> slurm/03_export_frontend.sh
 ```
 
 Check `slurm/README.md` for the full pipeline, and confirm before submitting
-step 03 that its flags are the ones you want — `--skip-tiles` skips the map
-overlay, `--skip-inputs` skips the review imagery.
+step 03 that its flags are the ones you want. By default it now only passes
+`--skip-tiles` (skips the map overlay; see decision D3 in
+`../AUTOMATION_PLAN.md` for why it stays on) — every rescan otherwise
+publishes fresh review imagery, since `--skip-inputs` was removed from the
+default call (a new positive tile needs `inputs/{tile}.tif` or the
+Expert-Review tab 404s on it). Pass `--skip-inputs` yourself if you
+deliberately want to skip it for one run. Step 03 also tags the HF dataset
+repo with the export's `scan_id` once every upload succeeds — reviews
+submitted afterwards belong to that round.

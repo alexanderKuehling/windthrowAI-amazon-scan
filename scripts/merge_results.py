@@ -9,11 +9,20 @@ Outputs:
     outputs/windthrow_amazon.vrt     – virtual mosaic (open in QGIS / gdal)
     outputs/windthrow_amazon.geojson – vectorised windthrow polygons
 
+At the end, best-effort compares this run's positive count against the
+inputs_index.csv currently published on HF and warns loudly if it moved by
+more than 50% — the only guard against a classifier fine-tuned into flagging
+almost everything (AUTOMATION_PLAN.md F7/T8). Advisory only: a download
+failure here (offline, no prior export, no token) only prints a note and
+never fails the merge.
 """
 
+import csv
+import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 import geopandas as gpd
 import pandas as pd
@@ -27,6 +36,53 @@ sys.path.insert(0, str(ROOT))
 from src.config import GRID_FILE, OUTPUTS_DIR, TILES_PER_JOB
 from src.tile_grid import n_jobs
 
+# Same dataset scripts/export_for_frontend.py publishes to. Declared here
+# rather than imported so this script doesn't pull in that module's GDAL-tiling
+# machinery just to read one constant (mirrors summarize_reviews.py's HF_REPO_ID).
+HF_DATASET_REPO = "alexKlg/windthrowAI-dataset-segmentation_results"
+
+
+def _published_positive_count(repo_id: str) -> Optional[int]:
+    """Row count of the currently-published inputs_index.csv (one row per
+    positive tile), for a sanity check against this run's positive count.
+
+    Returns None on any failure — no network, no prior export, no token — so a
+    download problem here can only skip the check below; it must never fail
+    the merge (AUTOMATION_PLAN.md T8)."""
+    try:
+        from huggingface_hub import hf_hub_download
+
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HF_WRITE_TOKEN")
+        path = hf_hub_download(repo_id=repo_id, repo_type="dataset",
+                                filename="inputs_index.csv", token=token)
+        with open(path, newline="") as f:
+            return sum(1 for _ in csv.DictReader(f))
+    except Exception as exc:  # noqa: BLE001 — this check is best-effort only
+        print(f"  (could not fetch previous inputs_index.csv for comparison: {exc})")
+        return None
+
+
+def _print_positive_delta(n_new: int) -> None:
+    """Compare this run's positive count against the last published index —
+    the only guard (until it is reviewed) against a classifier that got
+    fine-tuned into flagging almost everything. Advisory only: it prints a
+    line and, if the swing is large, a loud warning; it never blocks."""
+    n_old = _published_positive_count(HF_DATASET_REPO)
+    if n_old is None:
+        return
+
+    if n_old == 0:
+        delta_pct = 0.0 if n_new == 0 else float("inf")
+    else:
+        delta_pct = (n_new - n_old) / n_old * 100
+
+    print(f"positives: {n_old:,} -> {n_new:,} ({delta_pct:+.1f}%)")
+    if abs(delta_pct) > 50:
+        print(
+            f"  !! positive count changed by {delta_pct:+.1f}% since the last "
+            "published inputs_index.csv — check the classifier before "
+            "exporting/publishing this run"
+        )
 
 
 def main():
@@ -82,6 +138,8 @@ def main():
             print(f"Vector output → {out_geojson}  ({len(gdf)} polygon(s))")
     else:
         print("No positive tiles found – nothing to mosaic.")
+
+    _print_positive_delta(int(df["is_positive"].sum()))
 
 
 if __name__ == "__main__":

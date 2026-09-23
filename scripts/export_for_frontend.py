@@ -17,12 +17,25 @@ Steps:
      recorded (windthrow `coverage` %, classifier confidence `clf_prob`, segmenter
      confidence, `valid_frac` / `cloud_mean` / acquisition dates), so the
      Expert-Review tab can filter and prioritise tiles without fetching imagery.
+     The last column is `scan_id` (see below).
   6. Stage each positive tile's proposed mask as a single-band uint8 GeoTIFF
      (masks/{tile_id}.tif), aligned to inputs/{tile_id}.tif, for the Expert-Review tab.
   7. Optionally (--include-probs) stage the segmenter probability maps as
      probs/{tile_id}.tif (uint8, probability = DN/255).
-  8. Upload geojson + tiles/ + inputs/ + inputs_index.csv + masks/ (+ probs/) to
-     the HF dataset repo.
+  8. Write scan_meta.json (model provenance + tile count for this export).
+  9. Upload, in an order a reviewer can safely browse mid-upload: geojson ->
+     tiles -> inputs -> masks -> probs -> scan_meta.json -> inputs_index.csv
+     *last* (AUTOMATION_PLAN.md contract 4.2/4.3, ticket T2/T8). The index is
+     what makes a tile visible to the Expert-Review tab, so it must not go up
+     before that tile's imagery and mask are already there. On success, tag
+     the dataset repo with scan_id (skip with --no-tag).
+
+Every export is stamped with a `scan_id` (format `scan-YYYYMMDDTHHMMSSZ`,
+UTC of the export; see AUTOMATION_PLAN.md contract 4.1). It is computed
+automatically, or pinned with `--scan-id` (e.g. to reproduce `scan-legacy`).
+`--dry-run` runs every step above except the actual HF upload and the tag,
+and prints what would be uploaded instead — the only mode a reviewing agent
+should ever run.
 
 Requires on PATH: gdalbuildvrt, gdal2tiles.py (part of GDAL).
 Requires Python packages: rasterio, geopandas, shapely, huggingface_hub.
@@ -31,10 +44,13 @@ the target dataset repo.
 """
 
 import argparse
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +63,8 @@ from shapely.geometry import shape
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+from src.config import MODEL_VERSIONS_FILE
+
 RESEG_DIR    = ROOT / "outputs_resegment"
 ORIG_DIR     = ROOT / "outputs"
 WORK_DIR     = ROOT / "outputs_final"
@@ -58,8 +76,13 @@ PROBS_DIR    = WORK_DIR / "probs"
 VRT_PATH     = WORK_DIR / "mosaic.vrt"
 GEOJSON_PATH = WORK_DIR / "windthrow.geojson"
 INPUTS_INDEX_PATH = WORK_DIR / "inputs_index.csv"
+SCAN_META_PATH    = WORK_DIR / "scan_meta.json"
 
 HF_REPO_ID   = "alexKlg/windthrowAI-dataset-segmentation_results"
+
+# AUTOMATION_PLAN.md contract 4.1 — used by every scan_id validator across the
+# four repos (tileloading, expert-review, training, amazon-scan).
+SCAN_ID_RE = re.compile(r"^scan-(legacy|\d{8}T\d{6}Z)$")
 
 # Web encoding of the model inputs: reflectance = DN * WEB_SCALE + WEB_OFFSET.
 # uint16 + deflate is ~3.5x smaller than the raw float32/LZW tif (see encode_input_for_web).
@@ -67,10 +90,19 @@ WEB_SCALE  = 1e-4
 WEB_OFFSET = -1.0   # DN 0..65535 -> -1.0 .. 5.5535 (covers negative NBR)
 
 
+def default_scan_id() -> str:
+    return "scan-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hf-repo", default=HF_REPO_ID)
     ap.add_argument("--zoom",    default="5-13", help="gdal2tiles.py -z range")
+    ap.add_argument("--scan-id", default=None,
+                    help="override the auto-generated scan_id (default: "
+                         "scan-<UTC now>). Must match "
+                         f"{SCAN_ID_RE.pattern!r} (AUTOMATION_PLAN.md contract 4.1), "
+                         "e.g. to reproduce scan-legacy.")
     ap.add_argument("--skip-tiles", action="store_true", help="only export GeoJSON, skip raster tiles")
     ap.add_argument("--skip-inputs", action="store_true", help="skip exporting model-input GeoTIFFs")
     ap.add_argument("--skip-masks", action="store_true", help="skip exporting per-tile mask GeoTIFFs")
@@ -80,7 +112,19 @@ def parse_args():
                          "with --skip-inputs")
     ap.add_argument("--include-probs", action="store_true",
                     help="also publish probs/{tile_id}.tif, the segmenter probability maps")
-    return ap.parse_args()
+    ap.add_argument("--no-tag", action="store_true",
+                    help="skip tagging the HF dataset repo with scan_id after upload")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="run every export step but skip the HF upload and the dataset "
+                         "tag; print what would be uploaded instead")
+    args = ap.parse_args()
+
+    if args.scan_id is not None and not SCAN_ID_RE.match(args.scan_id):
+        ap.error(f"--scan-id {args.scan_id!r} must match {SCAN_ID_RE.pattern!r} "
+                  "(AUTOMATION_PLAN.md contract 4.1)")
+    args.scan_id = args.scan_id or default_scan_id()
+
+    return args
 
 
 def _read_results_csv(csv_path: Path) -> pd.DataFrame:
@@ -288,7 +332,7 @@ def export_inputs(results: dict):
     print(f"  -> {INPUTS_DIR}  ({len(entries)} file(s))")
 
 
-def export_index(results: dict):
+def export_index(results: dict, scan_id: str):
     """Write inputs_index.csv: one row per reviewable tile with its bbox and the
     scores the scan recorded for it.
 
@@ -297,7 +341,10 @@ def export_index(results: dict):
     carry the model's confidence, `valid_frac`/`cloud_mean`/`date_*` the quality
     and date of the imagery behind the detection. Everything comes from
     results.csv — only `coverage` is recomputed from the mask when an older run
-    didn't record it."""
+    didn't record it.
+
+    `scan_id` is the last column (AUTOMATION_PLAN.md contract 4.2), the same
+    value on every row — readers must tolerate its absence in an older index."""
     entries = _reviewable(results)
     rows = []
     for tile_id, r in entries:
@@ -311,6 +358,7 @@ def export_index(results: dict):
             "lon_max": lon_max, "lat_max": lat_max,
             **{col: metrics.get(col, "") for col in METRIC_COLUMNS},
             "source": r.get("source", ""),
+            "scan_id": scan_id,
         })
 
     if not rows:
@@ -354,72 +402,135 @@ def export_masks(results: dict):
     print(f"  -> {MASKS_DIR}  ({len(entries)} file(s))")
 
 
+def _model_block() -> dict:
+    """{"classifier": {...}, "segmenter": {...}} for scan_meta.json (contract
+    4.3), copied from MODEL_VERSIONS_FILE (written once per scan by
+    scripts/resolve_model_versions.py). Either value is None — with a printed
+    warning — if that file is missing, e.g. a manual export run without step 00.
+
+    If outputs_resegment/ has any results (step 99 ran), the segmenter block is
+    overridden with the *local* checkpoint recorded in its run_meta.json: that
+    step never touches HF, so `revision` becomes "local:<path>" rather than a
+    commit sha, and `repo_id` is None."""
+    if not MODEL_VERSIONS_FILE.exists():
+        print(f"  !! {MODEL_VERSIONS_FILE.name} not found — scan_meta.json model block will be null")
+        return {"classifier": None, "segmenter": None}
+
+    versions = json.loads(MODEL_VERSIONS_FILE.read_text())
+    classifier = versions.get("classifier")
+    segmenter  = versions.get("segmenter")
+    classifier_block = (
+        {"repo_id": classifier["repo_id"], "revision": classifier["revision"]}
+        if classifier else None
+    )
+    segmenter_block = (
+        {"repo_id": segmenter["repo_id"], "revision": segmenter["revision"]}
+        if segmenter else None
+    )
+
+    reseg_meta_paths = sorted(RESEG_DIR.glob("job_*/run_meta.json"))
+    if reseg_meta_paths:
+        reseg_meta = json.loads(reseg_meta_paths[0].read_text())
+        segmenter_block = {
+            "repo_id": None,
+            "revision": f"local:{reseg_meta['segmenter_path']}",
+        }
+
+    return {"classifier": classifier_block, "segmenter": segmenter_block}
+
+
+def write_scan_meta(scan_id: str, n_positive_tiles: int) -> None:
+    """Write scan_meta.json at the export root (contract 4.3): which pinned
+    models produced this scan_id, and how many positive tiles it carries, so a
+    downstream reader (training's manifest, a human comparing rounds) doesn't
+    have to reconstruct it from model_versions.json + run_meta.json by hand."""
+    meta = {
+        "scan_id": scan_id,
+        "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **_model_block(),
+        "n_positive_tiles": n_positive_tiles,
+    }
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    SCAN_META_PATH.write_text(json.dumps(meta, indent=2))
+    print(f"  -> {SCAN_META_PATH}")
+
+
+# Upload order (contract, AUTOMATION_PLAN.md T2 step 4): geojson -> tiles ->
+# inputs -> masks -> probs -> scan_meta.json -> inputs_index.csv *last*.
+# inputs_index.csv is what makes a tile visible to the Expert-Review tab, so it
+# must go up only after that tile's imagery and mask are already there —
+# otherwise a reviewer can briefly see a new tile with no image, or an old
+# mask under a refreshed index (F7 in AUTOMATION_PLAN.md).
+def _upload_plan(args):
+    """[(local_path, path_in_repo, enabled, is_folder), ...] in upload order.
+    Shared by upload_to_hf (real) and print_upload_plan (--dry-run) so the two
+    can never drift apart."""
+    return [
+        (GEOJSON_PATH,       "windthrow.geojson", True,                False),
+        (TILES_DIR,          "tiles",             not args.skip_tiles, True),
+        (INPUTS_DIR,         "inputs",            not args.skip_inputs, True),
+        (MASKS_DIR,          "masks",             not args.skip_masks, True),
+        (PROBS_DIR,          "probs",             args.include_probs, True),
+        (SCAN_META_PATH,     "scan_meta.json",    True,                False),
+        (INPUTS_INDEX_PATH,  "inputs_index.csv",  not args.skip_index, False),
+    ]
+
+
 def upload_to_hf(repo_id: str, args):
     from huggingface_hub import HfApi
 
     api = HfApi()
     print(f"Uploading to HF dataset repo: {repo_id}")
 
-    if GEOJSON_PATH.exists():
-        api.upload_file(
-            path_or_fileobj=str(GEOJSON_PATH),
-            path_in_repo="windthrow.geojson",
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
-        print("  uploaded windthrow.geojson")
+    for path, path_in_repo, enabled, is_folder in _upload_plan(args):
+        if not enabled or not path.exists():
+            continue
+        if is_folder:
+            api.upload_folder(folder_path=str(path), path_in_repo=path_in_repo,
+                               repo_id=repo_id, repo_type="dataset")
+            print(f"  uploaded {path_in_repo}/")
+        else:
+            api.upload_file(path_or_fileobj=str(path), path_in_repo=path_in_repo,
+                             repo_id=repo_id, repo_type="dataset")
+            print(f"  uploaded {path_in_repo}")
 
-    if not args.skip_tiles and TILES_DIR.exists():
-        api.upload_folder(
-            folder_path=str(TILES_DIR),
-            path_in_repo="tiles",
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
-        print("  uploaded tiles/")
 
-    if not args.skip_inputs and INPUTS_DIR.exists():
-        api.upload_folder(
-            folder_path=str(INPUTS_DIR),
-            path_in_repo="inputs",
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
-        print("  uploaded inputs/")
+def tag_dataset(repo_id: str, scan_id: str):
+    """Tag the dataset repo at the commit the export just uploaded, so
+    `revision=scan_id` reproduces exactly what reviewers saw during this round
+    (contract 4.1). Called only after every upload above has succeeded."""
+    from huggingface_hub import HfApi
 
-    # Deliberately not tied to --skip-inputs: the index is the tile list and the
-    # per-tile scores the review UI reads, it costs one small file, and skipping
-    # the (large) input rasters is no reason to leave it stale.
-    if not args.skip_index and INPUTS_INDEX_PATH.exists():
-        api.upload_file(
-            path_or_fileobj=str(INPUTS_INDEX_PATH),
-            path_in_repo="inputs_index.csv",
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
-        print("  uploaded inputs_index.csv")
+    HfApi().create_tag(repo_id, tag=scan_id, repo_type="dataset")
+    print(f"  tagged {repo_id} @ {scan_id}")
 
-    if not args.skip_masks and MASKS_DIR.exists():
-        api.upload_folder(
-            folder_path=str(MASKS_DIR),
-            path_in_repo="masks",
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
-        print("  uploaded masks/")
 
-    if args.include_probs and PROBS_DIR.exists():
-        api.upload_folder(
-            folder_path=str(PROBS_DIR),
-            path_in_repo="probs",
-            repo_id=repo_id,
-            repo_type="dataset",
-        )
-        print("  uploaded probs/")
+def print_upload_plan(args, scan_id: str):
+    """--dry-run stand-in for upload_to_hf + tag_dataset: touches no HF state,
+    just prints the same order so the plan is visible without a write token."""
+    print(f"[dry-run] would upload to HF dataset repo: {args.hf_repo}")
+    for path, path_in_repo, enabled, is_folder in _upload_plan(args):
+        if not enabled:
+            continue
+        if not path.exists():
+            print(f"  [dry-run] would skip {path_in_repo} (not found)")
+            continue
+        if is_folder:
+            n = sum(1 for p in path.rglob("*") if p.is_file())
+            print(f"  [dry-run] would upload {path_in_repo}/  ({n} file(s))")
+        else:
+            print(f"  [dry-run] would upload {path_in_repo}")
+
+    if args.no_tag:
+        print(f"  [dry-run] --no-tag: would skip tagging {scan_id}")
+    else:
+        print(f"  [dry-run] would tag dataset @ {scan_id}")
 
 
 def main():
     args = parse_args()
+    scan_id = args.scan_id
+    print(f"scan_id: {scan_id}")
 
     final_results = collect_final_results()
     print(f"Final mask count (resegmented overrides original): {len(final_results)}")
@@ -431,13 +542,23 @@ def main():
     if not args.skip_inputs:
         export_inputs(final_results)
     if not args.skip_index:
-        export_index(final_results)
+        export_index(final_results, scan_id)
     if not args.skip_masks:
         export_masks(final_results)
     if args.include_probs:
         export_probs(final_results)
 
-    upload_to_hf(args.hf_repo, args)
+    write_scan_meta(scan_id, len(final_results))
+
+    if args.dry_run:
+        print_upload_plan(args, scan_id)
+    else:
+        upload_to_hf(args.hf_repo, args)
+        if not args.no_tag:
+            tag_dataset(args.hf_repo, scan_id)
+        else:
+            print("  --no-tag: skipped dataset tag")
+
     print("Done.")
 
 

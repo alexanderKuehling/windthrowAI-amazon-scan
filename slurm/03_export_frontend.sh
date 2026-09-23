@@ -20,4 +20,10 @@ CONDA_BASE=$(conda info --base)
 source $CONDA_BASE/etc/profile.d/conda.sh
 conda activate windthrowEnv
 
-python -u scripts/export_for_frontend.py --skip-tiles --skip-inputs
+# --skip-tiles is kept: whether a rescan should refresh the map overlay
+# (tiles/, used by windthrowAI-segmentation-FE-hosting) on every round is an
+# open decision — D3 in ../../AUTOMATION_PLAN.md. Drop this flag yourself once
+# that's answered; gdal2tiles over z5-13 is the expensive part of a run.
+# --skip-inputs was removed: new positive tiles need their review imagery
+# uploaded too, or the Expert-Review tab 404s on inputs/{tile}.tif (F7).
+python -u scripts/export_for_frontend.py --skip-tiles
