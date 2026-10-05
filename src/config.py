@@ -99,14 +99,16 @@ MERGE_MAX_ERROR_FRACTION = 0.01
 MERGE_MAX_POSITIVE_DELTA = 0.50
 
 # ── Imagery source ────────────────────────────────────────────────────────
+# "pc":  Microsoft Planetary Computer (src/data_pc.py), the default since
+#        2026-10-05 — the same USGS Collection 2 Level-2 scenes as public files,
+#        composited here with GEE's recipe, no compute quota. 19 of 20 live
+#        tiles were 99.4-99.98% bit-identical to GEE; PC lacks ~5% of GEE's
+#        scenes, and a tile whose best scene is among them gets the next best.
 # "gee": Google Earth Engine (src/data.py) — metered per project (monthly EECU
 #        tiers since 2026-04-27; the cause of the scan's rate limits).
-# "pc":  Microsoft Planetary Computer (src/data_pc.py) — the same USGS
-#        Collection 2 Level-2 scenes as public files, composited here, no
-#        compute quota. Check it with scripts/compare_sources.py before switching.
 # Override per run with WINDTHROW_DATA_SOURCE (SLURM passes it to every task)
-# or run_inference.py --source.
-DATA_SOURCE = os.environ.get("WINDTHROW_DATA_SOURCE", "gee")
+# or run_inference.py --source; scripts/compare_sources.py compares the two.
+DATA_SOURCE = os.environ.get("WINDTHROW_DATA_SOURCE", "pc")
 
 # ── Export rule: which flagged tiles count as detections ──────────────────
 # The classifier flags ~60% of scan tiles at CLASSIFIER_THRESHOLD, and on most

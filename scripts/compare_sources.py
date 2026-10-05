@@ -1,6 +1,6 @@
 """
-Check that Microsoft Planetary Computer tiles match the GEE tiles the scan
-uses, before switching DATA_SOURCE to "pc" (src/data_pc.py).
+Check that Microsoft Planetary Computer tiles (DATA_SOURCE "pc", the default,
+src/data_pc.py) match the GEE tiles (DATA_SOURCE "gee").
 
     python scripts/compare_sources.py --live 40              # fresh tiles from both sources
     python scripts/compare_sources.py --from-outputs 200     # vs inputs a GEE scan already saved
@@ -21,9 +21,9 @@ that Planetary Computer lacks. The table goes to outputs/compare_sources.csv,
 the summary ends in a verdict:
 
   MATCH     >= 90% of tiles have >= 95% identical pixels, and (with --models)
-            >= 98% of classifier decisions agree — switch with
-            WINDTHROW_DATA_SOURCE=pc (or DATA_SOURCE in src/config.py)
-  DIFFERS   anything else — read the per-tile table before switching
+            >= 98% of classifier decisions agree — the two are interchangeable
+  DIFFERS   anything else — read the per-tile table, and scan with
+            WINDTHROW_DATA_SOURCE=gee until it is understood
 
 What to expect (measured 2026-10-05 on 20 live tiles): where both sources hold
 the same scenes, 99.4-99.98% of pixels are bit-identical — the files are the
@@ -243,8 +243,8 @@ def main():
         print(f"classifier decisions agree: {agree:.1%}" +
               (f"   mask Dice (flagged tiles, median): {np.median(dice):.3f}" if dice else ""))
         ok = ok and agree >= MATCH_DECISION_SHARE
-    print("verdict: " + ("MATCH — PC can replace GEE (WINDTHROW_DATA_SOURCE=pc)" if ok else
-                         "DIFFERS — read the per-tile table before switching"))
+    print("verdict: " + ("MATCH — Planetary Computer and GEE are interchangeable" if ok else
+                         "DIFFERS — read the per-tile table; WINDTHROW_DATA_SOURCE=gee scans with GEE"))
 
 
 if __name__ == "__main__":

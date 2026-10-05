@@ -108,12 +108,12 @@ re-spent its whole quota on every attempt.
 WINDTHROW_DATA_SOURCE=pc` (or `gee`) before `run_full_scan.sh` overrides it for
 one scan, and `scan_meta.json` records which one a round used.
 
-- **`gee`** (default) — Earth Engine composites each tile (`src/data.py`).
+- **`gee`** — Earth Engine composites each tile (`src/data.py`).
   Metered per project: since 2026-04-27 noncommercial projects get a monthly
   EECU tier (Community 150 h, Contributor 1,000 h with a billing account
   linked, free for noncommercial use), and a project past it is throttled.
   The project is shared with the live tileloading backend.
-- **`pc`** — Microsoft Planetary Computer (`src/data_pc.py`): the same USGS
+- **`pc`** (default since 2026-10-05) — Microsoft Planetary Computer (`src/data_pc.py`): the same USGS
   Collection 2 Level-2 scenes as public files, read and composited on the
   cluster with GEE's exact recipe. No account, no compute quota. Measured
   against GEE on 20 live tiles: 19 were 99.4-99.98% bit-identical; one
@@ -121,13 +121,17 @@ one scan, and `scan_meta.json` records which one a round used.
   ~5% of GEE's Amazon scenes (101 of 2,059), and a tile whose best scene is
   among them gets the next-best one.
 
-Before switching for good, compare on the cluster against a finished GEE scan
-(no GEE request needed) including the models' decisions:
+To compare the two on the cluster — against the inputs a finished GEE scan
+saved (no GEE request needed), including the models' decisions — or on fresh
+tiles:
 
 ```bash
-python scripts/compare_sources.py --from-outputs 300 --models   # verdict MATCH -> switch
+python scripts/compare_sources.py --from-outputs 300 --models   # verdict MATCH / DIFFERS
 python scripts/compare_sources.py --live 40                     # quick check, 40 GEE requests
 ```
+
+`run_full_scan.sh` checks that the Planetary Computer packages are installed
+before it submits anything.
 
 `PC_WORKERS` tiles are downloaded per task and `PC_ARRAY_PARALLEL` tasks run at
 once (`run_full_scan.sh` and `resume_scan.sh` pick the `%N` per source). A free

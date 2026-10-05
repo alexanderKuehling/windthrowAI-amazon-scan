@@ -38,6 +38,12 @@ fi
 
 SOURCE=$(python -c "from src.config import DATA_SOURCE; print(DATA_SOURCE)")
 echo "Imagery source: $SOURCE (set WINDTHROW_DATA_SOURCE=gee|pc to change)"
+# Every array task imports the source's client; a missing package would fail
+# all of them hours from now, so fail here instead.
+if [[ "$SOURCE" == "pc" ]] && ! python -c "import pystac_client, planetary_computer" 2>/dev/null; then
+    echo "Planetary Computer packages missing: pip install -r requirements.txt" >&2
+    exit 1
+fi
 
 echo "Submitting grid generation + model resolution (00), waiting..."
 if ! sbatch --wait slurm/00_generate_grid.sh; then
