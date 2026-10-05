@@ -22,10 +22,22 @@
 #
 # A failed array task in 01 does not cancel 02/03 by itself; thanks to
 # --kill-on-invalid-dep=yes on those scripts it instead surfaces as a visible
-# CANCELLED job in `squeue` rather than sitting silently pending forever.
+# CANCELLED job in `squeue` rather than sitting silently pending forever. The
+# same happens when 02 stops on missing tiles, download errors or a drifted
+# positive count. Either way, slurm/resume_scan.sh finishes the scan.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Step 03 overwrites inputs/ and masks/ on HF. Reviews from before scan_id
+# existed are pinned to the `scan-legacy` tag, so refuse to start a scan whose
+# export would destroy what those reviewers saw (one-time tag: LOOP.md).
+if ! python scripts/export_for_frontend.py --check-legacy-tag; then
+    exit 1
+fi
+
+SOURCE=$(python -c "from src.config import DATA_SOURCE; print(DATA_SOURCE)")
+echo "Imagery source: $SOURCE (set WINDTHROW_DATA_SOURCE=gee|pc to change)"
 
 echo "Submitting grid generation + model resolution (00), waiting..."
 if ! sbatch --wait slurm/00_generate_grid.sh; then
@@ -38,10 +50,14 @@ from src.tile_grid import n_jobs
 from src.config import GRID_FILE, TILES_PER_JOB
 print(n_jobs(GRID_FILE, TILES_PER_JOB) - 1)
 ")
-echo "Array range: 0-$N"
+# At most this many array tasks at once — on GEE the scan's share of the
+# project's concurrent-request quota, on Planetary Computer a bandwidth share
+# (see src/config.py and src/sources.py::array_parallel).
+PAR=$(python -c "from src.sources import array_parallel; print(array_parallel())")
+echo "Array range: 0-$N (max $PAR running)"
 
-INFER_JOBID=$(sbatch --parsable --array=0-"$N" slurm/01_inference_array.sh)
-echo "inference   : $INFER_JOBID (array 0-$N)"
+INFER_JOBID=$(sbatch --parsable --array=0-"$N"%"$PAR" slurm/01_inference_array.sh)
+echo "inference   : $INFER_JOBID (array 0-$N%$PAR)"
 
 MERGE_JOBID=$(sbatch --parsable --dependency=afterok:"$INFER_JOBID" slurm/02_merge_results.sh)
 echo "merge       : $MERGE_JOBID"

@@ -12,7 +12,8 @@ Outputs:
 
 Mirrors the column set run_inference.py writes, so the export reads either
 directory the same way. `clf_prob` is carried over from the source results CSV —
-this step never re-runs the classifier.
+this step never re-runs the classifier. Like run_inference.py it downloads and
+writes DOWNLOAD_CHUNK tiles at a time, from --source (default config.DATA_SOURCE).
 """
 
 import argparse
@@ -30,15 +31,16 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.config import (
+    NBR_ENCODING,
     BATCH_SIZE,
+    DATA_SOURCE,
+    DOWNLOAD_CHUNK,
     OUTPUTS_DIR,
     SEGMENTER_BACKBONE,
     SEGMENTER_THRESHOLD,
     TILES_PER_JOB,
 )
 from src.data import (
-    download_tile_with_meta,
-    init_gee,
     preprocess,
     save_input,
     save_mask,
@@ -47,6 +49,7 @@ from src.data import (
 from src.models import load_segmenter
 from src.pipeline import segment_probs
 from src.results import base_row, fill_segmentation, open_results_csv
+from src.sources import SOURCES, default_workers, download_in_chunks, get_downloader
 
 
 def parse_args():
@@ -59,6 +62,12 @@ def parse_args():
     ap.add_argument("--results-csv",    type=Path, default=OUTPUTS_DIR / "all_results.csv")
     ap.add_argument("--out-dir",        type=Path, default=ROOT / "outputs_resegment")
     ap.add_argument("--key-path",       default=None)
+    ap.add_argument("--source",         choices=SOURCES, default=DATA_SOURCE,
+                     help="imagery source: gee or pc (Planetary Computer)")
+    ap.add_argument("--workers",        type=int, default=None,
+                     help="tiles downloaded concurrently (default per source, see src/config.py)")
+    ap.add_argument("--chunk-tiles",    type=int, default=DOWNLOAD_CHUNK,
+                     help="tiles downloaded and written per round")
     ap.add_argument("--seg-threshold",  type=float, default=SEGMENTER_THRESHOLD,
                      help="binarisation of the segmenter output; the probability "
                           "map is saved regardless")
@@ -74,7 +83,8 @@ def main():
     print(f"[resegment {args.job_idx}] device={device}  GPUs={n_gpus}")
 
     key_path = Path(args.key_path) if args.key_path else None
-    init_gee(key_path=key_path)
+    download = get_downloader(args.source, key_path=key_path)
+    workers  = args.workers or default_workers(args.source)
 
     segmenter, segmenter_backbone = load_segmenter(
         args.segmenter_path, device, encoder_name=args.backbone
@@ -108,76 +118,66 @@ def main():
     if "clf_prob" in df.columns:
         clf_probs = {t: p for t, p in zip(df["tile_id"], df["clf_prob"]) if pd.notna(p)}
 
-    pending_ids, pending_bboxes, pending_arrays, pending_raw, pending_meta = [], [], [], [], []
-    failed_ids = []
+    failed_ids, n_done = [], 0
+
+    todo = [
+        (row["tile_id"], (row["lon_min"], row["lat_min"], row["lon_max"], row["lat_max"]))
+        for _, row in chunk.iterrows() if row["tile_id"] not in done_ids
+    ]
 
     t0 = time.perf_counter()
-    for _, row in chunk.iterrows():
-        tile_id = row["tile_id"]
-        if tile_id in done_ids:
-            continue
-        bbox = (row["lon_min"], row["lat_min"], row["lon_max"], row["lat_max"])
-        ms, meta = download_tile_with_meta(bbox)
-        if ms is None:
-            failed_ids.append(tile_id)
-            writer.writerow(base_row(tile_id, bbox, meta, download_ok=False))
-            continue
-        pending_ids.append(tile_id)
-        pending_bboxes.append(bbox)
-        pending_meta.append(meta)
-        pending_raw.append(ms)
-        pending_arrays.append(preprocess(ms).squeeze(0).numpy())
-    csv_file.flush()
-
-    print(
-        f"[resegment {args.job_idx}] downloaded {len(pending_arrays)} tiles "
-        f"({len(failed_ids)} failed) in {time.perf_counter() - t0:.1f}s"
-    )
-
     effective_bs = BATCH_SIZE * max(n_gpus, 1)
     n_pos = 0
-    for start_i in range(0, len(pending_arrays), effective_bs):
-        sl           = slice(start_i, start_i + effective_bs)
-        batch_ids    = pending_ids[sl]
-        batch_bboxes = pending_bboxes[sl]
-        batch_raw    = pending_raw[sl]
-        batch_meta   = pending_meta[sl]
-        batch_np     = np.stack(pending_arrays[sl], axis=0)
-        batch_t      = torch.from_numpy(batch_np).to(device, non_blocking=True)
-        probs        = segment_probs(batch_t, segmenter)   # (B, H, W) float
-
-        for tile_id, bbox, prob, raw, meta in zip(
-            batch_ids, batch_bboxes, probs, batch_raw, batch_meta
-        ):
-            mask   = (prob >= args.seg_threshold).astype(np.uint8)
-            is_pos = bool(mask.sum() > 0)
-
-            record = base_row(tile_id, bbox, meta, download_ok=True)
-            record["is_positive"] = is_pos
-            record["clf_prob"]    = clf_probs.get(tile_id, "")
-            fill_segmentation(record, prob, mask)   # recorded for rejects too:
-            # a tile the new segmenter drops is still evidence about the model
-            if is_pos:
-                n_pos += 1
-                mp = out_dir / f"{tile_id}_mask.tif"
-                save_mask(mask, bbox, mp)
-                record["mask_path"] = str(mp.relative_to(ROOT))
-
-                ip = out_dir / f"{tile_id}_input.tif"
-                save_input(raw, bbox, ip)
-                record["input_path"] = str(ip.relative_to(ROOT))
-
-                if not args.no_prob_maps:
-                    pp = out_dir / f"{tile_id}_prob.tif"
-                    save_prob_map(prob, bbox, pp)
-                    record["prob_path"] = str(pp.relative_to(ROOT))
-            writer.writerow(record)
+    for part in download_in_chunks(todo, download, workers, args.chunk_tiles):
+        ok = []
+        for tile_id, bbox, ms, meta in part:
+            if ms is None:
+                failed_ids.append(tile_id)
+                writer.writerow(base_row(tile_id, bbox, meta, download_ok=False))
+            else:
+                ok.append((tile_id, bbox, ms, meta))
         csv_file.flush()
+
+        for start_i in range(0, len(ok), effective_bs):
+            batch   = ok[start_i : start_i + effective_bs]
+            batch_t = torch.from_numpy(
+                np.stack([preprocess(ms).squeeze(0).numpy() for _, _, ms, _ in batch], axis=0)
+            ).to(device, non_blocking=True)
+            probs = segment_probs(batch_t, segmenter)   # (B, H, W) float
+
+            for (tile_id, bbox, raw, meta), prob in zip(batch, probs):
+                mask   = (prob >= args.seg_threshold).astype(np.uint8)
+                is_pos = bool(mask.sum() > 0)
+
+                record = base_row(tile_id, bbox, meta, download_ok=True)
+                record["is_positive"] = is_pos
+                record["clf_prob"]    = clf_probs.get(tile_id, "")
+                fill_segmentation(record, prob, mask)   # recorded for rejects too:
+                # a tile the new segmenter drops is still evidence about the model
+                if is_pos:
+                    n_pos += 1
+                    mp = out_dir / f"{tile_id}_mask.tif"
+                    save_mask(mask, bbox, mp)
+                    record["mask_path"] = str(mp.relative_to(ROOT))
+
+                    ip = out_dir / f"{tile_id}_input.tif"
+                    save_input(raw, bbox, ip)
+                    record["input_path"] = str(ip.relative_to(ROOT))
+
+                    if not args.no_prob_maps:
+                        pp = out_dir / f"{tile_id}_prob.tif"
+                        save_prob_map(prob, bbox, pp)
+                        record["prob_path"] = str(pp.relative_to(ROOT))
+                writer.writerow(record)
+            csv_file.flush()
+        n_done += len(ok)
+        print(f"[resegment {args.job_idx}]   {n_done + len(failed_ids)}/{len(todo)} tiles "
+              f"({time.perf_counter() - t0:.0f}s)")
 
     csv_file.close()
     print(
         f"[resegment {args.job_idx}] positives (new segmenter): "
-        f"{n_pos}/{len(pending_arrays)}"
+        f"{n_pos}/{n_done}"
     )
 
     (out_dir / "run_meta.json").write_text(json.dumps({
@@ -190,7 +190,9 @@ def main():
         "source_results_csv":  str(args.results_csv),
         "chunk_size":          args.chunk_size,
         "prob_maps":           not args.no_prob_maps,
-        "n_tiles_processed":   len(pending_arrays),
+        "data_source":         args.source,
+        "nbr_encoding":        NBR_ENCODING,
+        "n_tiles_processed":   n_done,
         "n_download_failed":   len(failed_ids),
         "n_positive":          n_pos,
     }, indent=2))

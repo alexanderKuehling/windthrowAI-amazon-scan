@@ -17,4 +17,8 @@ CONDA_BASE=$(conda info --base)
 source $CONDA_BASE/etc/profile.d/conda.sh
 conda activate windthrowEnv
 
-python -u scripts/merge_results.py
+# Exits non-zero — cancelling the chained export (03) — on missing tiles, too
+# many download errors or a positive count that moved by more than 50%; see
+# the script's docstring. slurm/resume_scan.sh forwards --allow-errors /
+# --accept-delta here.
+python -u scripts/merge_results.py "$@"

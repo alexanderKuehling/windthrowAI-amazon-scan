@@ -25,6 +25,11 @@ results.csv records the model's *scores*, not just its decisions: `clf_prob` for
 every downloaded tile (including negatives) and the segmenter probability map for
 every positive one. Both thresholds therefore become post-processing choices —
 re-thresholding needs no GPU pass and no second GEE download.
+
+Tiles are processed DOWNLOAD_CHUNK at a time — download, classify, write — so a
+task that hits its walltime keeps every finished chunk, and its resubmit
+downloads only the rest. --source picks the imagery: GEE or Microsoft Planetary
+Computer (src/sources.py, default config.DATA_SOURCE).
 """
 
 import argparse
@@ -35,7 +40,6 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
 
 import numpy as np
 import torch
@@ -44,11 +48,14 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.config import (
+    NBR_ENCODING,
     BATCH_SIZE,
     CLASSIFIER_THRESHOLD,
     CLOUD_COVER_MAX,
     DATE_FROM,
     DATE_TO,
+    DATA_SOURCE,
+    DOWNLOAD_CHUNK,
     GEE_KEY_PATH,
     GRID_FILE,
     MODEL_VERSIONS_FILE,
@@ -58,11 +65,12 @@ from src.config import (
     TILE_SIZE_PX,
     TILES_PER_JOB,
 )
-from src.data import download_tile_with_meta, init_gee, preprocess, save_input, save_mask, save_prob_map
+from src.data import preprocess, save_input, save_mask, save_prob_map
 from src.hub import download_checkpoint
 from src.models import load_classifier, load_segmenter
 from src.pipeline import classify_probs, segment_probs
-from src.results import base_row, fill_segmentation, is_control_sample, open_results_csv
+from src.results import base_row, fill_segmentation, is_control_sample, is_retryable, open_results_csv
+from src.sources import SOURCES, default_workers, download_in_chunks, get_downloader
 from src.tile_grid import get_job_tiles
 
 
@@ -83,6 +91,15 @@ def parse_args():
                     help=f"GEE service-account JSON (default: {GEE_KEY_PATH})")
     ap.add_argument("--date-from", default=None)
     ap.add_argument("--date-to",   default=None)
+    ap.add_argument("--source", choices=SOURCES, default=DATA_SOURCE,
+                    help="imagery source: gee (Earth Engine) or pc (Microsoft "
+                         "Planetary Computer); default config.DATA_SOURCE")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="tiles downloaded concurrently in this task (default: "
+                         "GEE_WORKERS for gee — times the array's %%N it must stay "
+                         "under the project's 40 — or PC_WORKERS for pc)")
+    ap.add_argument("--chunk-tiles", type=int, default=DOWNLOAD_CHUNK,
+                    help="tiles downloaded, classified and written per round")
     ap.add_argument("--clf-threshold", type=float, default=CLASSIFIER_THRESHOLD,
                     help="gate for stage 1; clf_prob is recorded regardless")
     ap.add_argument("--seg-threshold", type=float, default=SEGMENTER_THRESHOLD,
@@ -152,8 +169,9 @@ def main():
     classifier_path, segmenter_path, revisions = _resolve_checkpoint_paths(args)
 
     key_path = Path(args.key_path) if args.key_path else None
-    init_gee(key_path=key_path)
-    print(f"[job {args.job_idx}] GEE initialised")
+    download = get_downloader(args.source, key_path=key_path)
+    workers  = args.workers or default_workers(args.source)
+    print(f"[job {args.job_idx}] imagery source: {args.source} ({workers} tiles in flight)")
 
     classifier = load_classifier(classifier_path, device)
     segmenter, segmenter_backbone = load_segmenter(
@@ -180,122 +198,117 @@ def main():
     if args.date_from: dl_kwargs["date_from"] = args.date_from
     if args.date_to:   dl_kwargs["date_to"]   = args.date_to
 
-    # ── Download all tiles first, accumulate into batches for GPU ─────────
-    # This way DataParallel always gets full batches (both GPUs stay busy).
-    pending_ids:    List[str]            = []
-    pending_bboxes: List[tuple]          = []
-    pending_arrays: List[np.ndarray]     = []
-    pending_raw:    List[np.ndarray]     = []
-    pending_meta:   List[dict]           = []
-    failed_rows:    List[dict]           = []
+    todo = [
+        (row["tile_id"], (row["lon_min"], row["lat_min"], row["lon_max"], row["lat_max"]))
+        for _, row in tiles.iterrows() if row["tile_id"] not in done_ids
+    ]
 
-    t_dl_start = time.perf_counter()
-    for _, row in tiles.iterrows():
-        tile_id = row["tile_id"]
-        if tile_id in done_ids:
-            continue
-        bbox = (row["lon_min"], row["lat_min"], row["lon_max"], row["lat_max"])
-        ms, meta = download_tile_with_meta(bbox, **dl_kwargs)
-        if ms is None:
-            failed_rows.append(base_row(tile_id, bbox, meta, download_ok=False))
-            continue
-        pending_ids.append(tile_id)
-        pending_bboxes.append(bbox)
-        pending_meta.append(meta)
-        pending_raw.append(ms)                                    # (7, H, W) raw
-        pending_arrays.append(preprocess(ms).squeeze(0).numpy())  # (7, H, W) normalised
-
-    t_dl = time.perf_counter() - t_dl_start
-    print(
-        f"[job {args.job_idx}] Downloaded {len(pending_arrays)} tiles "
-        f"({len(failed_rows)} failed) in {t_dl:.1f}s"
-    )
-
-    # Write download failures immediately
-    for row in failed_rows:
-        writer.writerow(row)
-    csv_file.flush()
-
-    # ── GPU inference in batches ──────────────────────────────────────────
     # Use 2× batch_size when 2 GPUs are present so each GPU handles batch_size items
     effective_bs = BATCH_SIZE * max(n_gpus, 1)
 
-    t_gpu_start = time.perf_counter()
-    n_pos = 0
-    n_control = 0
-    for start_i in range(0, len(pending_arrays), effective_bs):
-        sl           = slice(start_i, start_i + effective_bs)
-        batch_ids    = pending_ids[sl]
-        batch_bboxes = pending_bboxes[sl]
-        batch_raw    = pending_raw[sl]
-        batch_meta   = pending_meta[sl]
-        batch_np     = np.stack(pending_arrays[sl], axis=0)
-        batch_t      = torch.from_numpy(batch_np).to(device, non_blocking=True)
+    def infer_and_write(items) -> tuple:
+        """Classify, segment and write one chunk's downloaded tiles; returns
+        (n_positive, n_control). Every batch is flushed to results.csv at once."""
+        n_pos_chunk, n_control_chunk = 0, 0
+        for start_i in range(0, len(items), effective_bs):
+            batch   = items[start_i : start_i + effective_bs]
+            batch_t = torch.from_numpy(
+                np.stack([preprocess(ms).squeeze(0).numpy() for _, _, ms, _ in batch], axis=0)
+            ).to(device, non_blocking=True)
 
-        # Stage 1: classify the whole batch — the probability is kept, not just
-        # the gate decision, so the threshold can be revisited without a re-scan.
-        clf_probs = classify_probs(batch_t, classifier)      # float32 (B,)
-        preds     = clf_probs >= args.clf_threshold
+            # Stage 1: classify the whole batch — the probability is kept, not just
+            # the gate decision, so the threshold can be revisited without a re-scan.
+            clf_probs = classify_probs(batch_t, classifier)      # float32 (B,)
+            preds     = clf_probs >= args.clf_threshold
 
-        # Stage 2: segment only the tiles the classifier gated through
-        pos_local = [i for i, p in enumerate(preds) if p]
-        seg: dict = {}
-        if pos_local:
-            idx  = torch.as_tensor(pos_local, device=batch_t.device)
-            maps = segment_probs(batch_t.index_select(0, idx), segmenter)  # (P, H, W)
-            seg  = {li: maps[k] for k, li in enumerate(pos_local)}
+            # Stage 2: segment only the tiles the classifier gated through
+            pos_local = [i for i, p in enumerate(preds) if p]
+            seg: dict = {}
+            if pos_local:
+                idx  = torch.as_tensor(pos_local, device=batch_t.device)
+                maps = segment_probs(batch_t.index_select(0, idx), segmenter)  # (P, H, W)
+                seg  = {li: maps[k] for k, li in enumerate(pos_local)}
 
-        # Write this batch out immediately – a crash keeps everything so far
-        for i, (tile_id, bbox, raw, meta) in enumerate(
-            zip(batch_ids, batch_bboxes, batch_raw, batch_meta)
-        ):
-            record = base_row(tile_id, bbox, meta, download_ok=True)
-            record["clf_prob"] = round(float(clf_probs[i]), 6)
+            for i, (tile_id, bbox, raw, meta) in enumerate(batch):
+                record = base_row(tile_id, bbox, meta, download_ok=True)
+                record["clf_prob"] = round(float(clf_probs[i]), 6)
 
-            pos  = bool(preds[i])
-            prob = seg.get(i)
-            record["is_positive"] = pos
-            if pos and prob is not None:
-                n_pos += 1
-                mask = (prob >= args.seg_threshold).astype(np.uint8)
+                pos  = bool(preds[i])
+                prob = seg.get(i)
+                record["is_positive"] = pos
+                if pos and prob is not None:
+                    n_pos_chunk += 1
+                    mask = (prob >= args.seg_threshold).astype(np.uint8)
 
-                mp = out_dir / f"{tile_id}_mask.tif"
-                save_mask(mask, bbox, mp)
-                record["mask_path"] = str(mp.relative_to(ROOT))
+                    mp = out_dir / f"{tile_id}_mask.tif"
+                    save_mask(mask, bbox, mp)
+                    record["mask_path"] = str(mp.relative_to(ROOT))
 
-                ip = out_dir / f"{tile_id}_input.tif"
-                save_input(raw, bbox, ip)
-                record["input_path"] = str(ip.relative_to(ROOT))
+                    ip = out_dir / f"{tile_id}_input.tif"
+                    save_input(raw, bbox, ip)
+                    record["input_path"] = str(ip.relative_to(ROOT))
 
-                if not args.no_prob_maps:
-                    pp = out_dir / f"{tile_id}_prob.tif"
-                    save_prob_map(prob, bbox, pp)
-                    record["prob_path"] = str(pp.relative_to(ROOT))
+                    if not args.no_prob_maps:
+                        pp = out_dir / f"{tile_id}_prob.tif"
+                        save_prob_map(prob, bbox, pp)
+                        record["prob_path"] = str(pp.relative_to(ROOT))
 
-                fill_segmentation(record, prob, mask)
-            elif not pos and is_control_sample(tile_id, meta.get("valid_frac")):
-                n_control += 1
-                ip = out_dir / f"{tile_id}_input.tif"
-                save_input(raw, bbox, ip)
-                record["input_path"] = str(ip.relative_to(ROOT))
-                record["is_control"] = True
-            writer.writerow(record)
+                    fill_segmentation(record, prob, mask)
+                elif not pos and is_control_sample(tile_id, meta.get("valid_frac")):
+                    n_control_chunk += 1
+                    ip = out_dir / f"{tile_id}_input.tif"
+                    save_input(raw, bbox, ip)
+                    record["input_path"] = str(ip.relative_to(ROOT))
+                    record["is_control"] = True
+                writer.writerow(record)
+            csv_file.flush()
+        return n_pos_chunk, n_control_chunk
+
+    # ── Download, infer, write — one chunk at a time ──────────────────────
+    t_start = time.perf_counter()
+    t_dl, t_gpu = 0.0, 0.0
+    total, n_pos, n_control, n_failed, n_errors = 0, 0, 0, 0, 0
+    t_mark = time.perf_counter()
+    for chunk in download_in_chunks(todo, download, workers, args.chunk_tiles, **dl_kwargs):
+        ok, failed = [], []
+        for tile_id, bbox, ms, meta in chunk:
+            if ms is None:
+                failed.append(base_row(tile_id, bbox, meta, download_ok=False))
+            else:
+                ok.append((tile_id, bbox, ms, meta))
+        t_dl += time.perf_counter() - t_mark
+
+        for row in failed:   # failures first: a crash in the GPU part keeps them
+            writer.writerow(row)
         csv_file.flush()
 
-    t_gpu = time.perf_counter() - t_gpu_start
-    print(
-        f"[job {args.job_idx}] GPU inference done in {t_gpu:.1f}s "
-        f"({t_gpu / max(len(pending_arrays), 1) * 1000:.2f} ms/tile)"
-    )
+        t_mark = time.perf_counter()
+        p, c = infer_and_write(ok)
+        t_gpu += time.perf_counter() - t_mark
+
+        total     += len(ok)
+        n_pos     += p
+        n_control += c
+        n_failed  += len(failed)
+        n_errors  += sum(1 for r in failed if is_retryable(r))
+        print(f"[job {args.job_idx}]   {total + n_failed}/{len(todo)} tiles "
+              f"({time.perf_counter() - t_start:.0f}s) — {n_pos} positive, {n_errors} failed so far")
+        t_mark = time.perf_counter()
 
     csv_file.close()
-
-    total = len(pending_arrays)
+    print(
+        f"[job {args.job_idx}] Downloaded {total} tiles in {t_dl:.1f}s — "
+        f"{n_failed - n_errors} without imagery, {n_errors} failed "
+        f"(retried when this task is resubmitted); GPU {t_gpu:.1f}s "
+        f"({t_gpu / max(total, 1) * 1000:.2f} ms/tile)"
+    )
     print(f"[job {args.job_idx}] positives: {n_pos}/{total}  spot-check tiles: {n_control}")
 
     # ── Run provenance ────────────────────────────────────────────────────
     # Which checkpoints and thresholds produced this job's rows, recorded next to
-    # them: results.csv alone cannot tell two runs apart after the fact.
+    # them: results.csv alone cannot tell two runs apart after the fact. The
+    # counts cover this invocation only; a resumed task's earlier rows are in
+    # results.csv.
     meta_path = out_dir / "run_meta.json"
     meta_path.write_text(json.dumps({
         "job_idx":              args.job_idx,
@@ -313,9 +326,13 @@ def main():
         "cloud_cover_max":      CLOUD_COVER_MAX,
         "tile_size_px":         TILE_SIZE_PX,
         "resolution_m":         RESOLUTION_M,
+        "data_source":          args.source,
+        "nbr_encoding":         NBR_ENCODING,
         "prob_maps":            not args.no_prob_maps,
         "n_tiles_processed":    total,
-        "n_download_failed":    len(failed_rows),
+        "n_download_failed":    n_failed,
+        "n_download_retryable": n_errors,
+        "workers":              workers,
         "n_positive":           n_pos,
         "n_control":            n_control,
         "git_commit":           _git_commit(),

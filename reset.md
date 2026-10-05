@@ -66,7 +66,8 @@ rm -rf outputs/* outputs/.??*
 ## Why a half-reset is worse than no reset
 
 `scripts/run_inference.py` resumes: on start it reads `outputs/job_XXXX/results.csv`
-and skips every `tile_id` already listed. That is what makes a failed array task
+and skips every `tile_id` already listed — except downloads that failed on a GEE
+error, which it retries. That is what makes a failed array task
 safe to resubmit — and what makes a leftover directory dangerous.
 
 If a `results.csv` from an **older** run is still in place, those tiles are
@@ -125,7 +126,7 @@ hand instead:
 sbatch slurm/00_generate_grid.sh          # regenerates tile_grid.parquet (if deleted) and model_versions.json
 # read the printed "--array=0-N" from slurm_logs/grid/*.out
 
-sbatch --array=0-115 slurm/01_inference_array.sh
+sbatch --array=0-115%8 slurm/01_inference_array.sh
 sbatch --dependency=afterok:<infer_jobid> slurm/02_merge_results.sh
 sbatch --dependency=afterok:<merge_jobid> slurm/03_export_frontend.sh
 ```

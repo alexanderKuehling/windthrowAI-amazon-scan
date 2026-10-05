@@ -8,7 +8,7 @@
 #SBATCH --job-name=WTAI_reseg
 #SBATCH --output=slurm_logs/reseg-%A/%a.out
 #SBATCH --error=slurm_logs/reseg-%A/%a.err
-#SBATCH --array=0-120       # adjust: ceil(num_positives / chunk_size) - 1
+#SBATCH --array=0-120%8     # adjust: ceil(num_positives / chunk_size) - 1; keep %8 on GEE (budget, see 01)
 #SBATCH --mail-type=FAIL
 
 # Optional, off the standard pipeline: re-segment the tiles already flagged

@@ -8,6 +8,9 @@ pyramid (PNG, Web Mercator z/x/y) for map overlay.
 Steps:
   1. Pick the final mask per tile: outputs/ (original run), overridden per tile by
      outputs_resegment/ (new segmenter) where it exists. Re-segmentation is optional.
+     Then apply the export rule (config.EXPORT_MIN_CLF_PROB / EXPORT_MIN_PATCH_PX,
+     src/results.py::is_detection): only flagged tiles with a windthrow-sized mask
+     patch are detections. Steps 2-6 publish those (plus the spot checks, below).
   2. Vectorize all final masks into one dissolved GeoJSON.
   3. Convert each mask to a red/transparent RGBA GeoTIFF, build a VRT mosaic,
      and render a PNG tile pyramid with gdal2tiles.py.
@@ -24,10 +27,12 @@ Steps:
      probs/{tile_id}.tif (uint8, probability = DN/255).
   8. Write scan_meta.json (model provenance + tile counts for this export).
 
-Steps 4-6 also cover the spot-check tiles: rejected tiles run_inference kept an
-input for (is_control). They get an all-zero mask and `kind=control` in the
-index, and stay out of the GeoJSON and the map (steps 2-3), which show
-detections only. Every other index row is `kind=flagged`.
+Steps 4-6 also cover the spot-check tiles: a hash sample of the tiles the scan
+does not report — rejected tiles run_inference kept an input for (is_control),
+and flagged tiles below the export rule (same src/results.py::is_control_sample).
+They get an all-zero mask and `kind=control` in the index, and stay out of the
+GeoJSON and the map (steps 2-3), which show detections only. Every other index
+row is a detection, `kind=flagged`.
   9. Upload, in an order a reviewer can safely browse mid-upload: geojson ->
      tiles -> inputs -> masks -> probs -> scan_meta.json -> inputs_index.csv
      *last* (AUTOMATION_PLAN.md contract 4.2/4.3, ticket T2/T8). The index is
@@ -41,6 +46,13 @@ automatically, or pinned with `--scan-id` (e.g. to reproduce `scan-legacy`).
 `--dry-run` runs every step above except the actual HF upload and the tag,
 and prints what would be uploaded instead — the only mode a reviewing agent
 should ever run.
+
+Before uploading, the export checks that the dataset still has what the
+reviews from before scan_id existed point at: the one-time `scan-legacy` tag
+(LOOP.md). It refuses to run the first scan_id export without it, since that
+export overwrites inputs/ and masks/ (`--allow-untagged-legacy` overrides).
+`--check-legacy-tag` runs only that check; slurm/run_full_scan.sh calls it
+before submitting anything.
 
 Requires on PATH: gdalbuildvrt, gdal2tiles.py (part of GDAL).
 Requires Python packages: rasterio, geopandas, shapely, huggingface_hub.
@@ -57,6 +69,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -68,7 +81,8 @@ from shapely.geometry import shape
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.config import MODEL_VERSIONS_FILE
+from src.config import EXPORT_MIN_CLF_PROB, EXPORT_MIN_PATCH_PX, MODEL_VERSIONS_FILE
+from src.results import is_control_sample, is_detection, patch_px_of
 
 RESEG_DIR    = ROOT / "outputs_resegment"
 ORIG_DIR     = ROOT / "outputs"
@@ -88,6 +102,7 @@ HF_REPO_ID   = "alexKlg/windthrowAI-dataset-segmentation_results"
 # AUTOMATION_PLAN.md contract 4.1 — used by every scan_id validator across the
 # four repos (tileloading, expert-review, training, amazon-scan).
 SCAN_ID_RE = re.compile(r"^scan-(legacy|\d{8}T\d{6}Z)$")
+LEGACY_SCAN_ID = "scan-legacy"
 
 # Web encoding of the model inputs: reflectance = DN * WEB_SCALE + WEB_OFFSET.
 # uint16 + deflate is ~3.5x smaller than the raw float32/LZW tif (see encode_input_for_web).
@@ -122,6 +137,12 @@ def parse_args():
     ap.add_argument("--dry-run", action="store_true",
                     help="run every export step but skip the HF upload and the dataset "
                          "tag; print what would be uploaded instead")
+    ap.add_argument("--check-legacy-tag", action="store_true",
+                    help="only check that the dataset is safe to overwrite (scan-legacy "
+                         "tagged, or an earlier scan_id export exists); exit 1 if not")
+    ap.add_argument("--allow-untagged-legacy", action="store_true",
+                    help="upload even though the pre-scan_id state was never tagged "
+                         "scan-legacy (its reviews then lose the exact imagery they judged)")
     args = ap.parse_args()
 
     if args.scan_id is not None and not SCAN_ID_RE.match(args.scan_id):
@@ -194,7 +215,7 @@ def encode_input_for_web(src_path: Path, dest_path: Path) -> None:
 # are copied into inputs_index.csv so the Expert-Review tab can show and filter on
 # model confidence and image quality without downloading anything.
 METRIC_COLUMNS = [
-    "coverage", "clf_prob", "seg_mean_prob_in_mask", "seg_max_prob",
+    "coverage", "max_patch_px", "clf_prob", "seg_mean_prob_in_mask", "seg_max_prob",
     "valid_frac", "n_scenes", "date_first", "date_last", "cloud_mean",
 ]
 
@@ -209,11 +230,21 @@ def _metrics(row) -> dict:
     return out
 
 
+def _job_nbr_encoding(job_dir: Path) -> str:
+    """NBR encoding a job wrote its inputs in (its run_meta.json, see
+    config.NBR_ENCODING); jobs from before the field existed wrote "rescaled"."""
+    try:
+        return json.loads((job_dir / "run_meta.json").read_text()).get("nbr_encoding") or "rescaled"
+    except (OSError, ValueError):
+        return "rescaled"
+
+
 def _result_rows(csv_path: Path):
     """Yield (tile_id, entry) per row of a results.csv; entry is None for a tile the
     run rejected (negative, or positive but no mask recorded). Rows whose mask file
     is missing are skipped entirely, so a half-written job can't drop a tile."""
     df = _read_results_csv(csv_path)
+    nbr_encoding = _job_nbr_encoding(csv_path.parent)
     for _, row in df.iterrows():
         tile_id = row["tile_id"]
         if not _is_true(row.get("is_positive")) or not _nonempty(row.get("mask_path")):
@@ -228,6 +259,7 @@ def _result_rows(csv_path: Path):
             "prob_path":  ROOT / str(row["prob_path"]).strip() if _nonempty(row.get("prob_path")) else None,
             "bbox": tuple(float(row[c]) for c in ("lon_min", "lat_min", "lon_max", "lat_max")),
             "metrics": _metrics(row),
+            "nbr_encoding": nbr_encoding,
         }
 
 
@@ -263,17 +295,32 @@ def collect_final_results() -> dict:
     return final
 
 
-def collect_control_tiles(final: dict) -> dict:
-    """tile_id -> entry for every spot-check tile of the original run: a tile the
-    classifier rejected whose input run_inference kept (is_control, see
-    src/results.py::is_control_sample). No mask on disk — the proposed mask is
-    empty by definition. A tile that is also in `final` (positive after all,
-    e.g. a resumed job) is a detection, not a control."""
+def apply_export_rule(flagged: dict) -> tuple:
+    """Split the flagged tiles into (detections, dropped) by the export rule
+    (src/results.py::is_detection). Each entry's `max_patch_px` comes from
+    results.csv or, for a run from before that column, from its mask file."""
+    detections, dropped = {}, {}
+    for tile_id, entry in flagged.items():
+        metrics = entry["metrics"]
+        patch = patch_px_of({"max_patch_px": metrics.get("max_patch_px"), "mask_path": str(entry["mask_path"])}, ROOT)
+        metrics["max_patch_px"] = str(patch)
+        (detections if is_detection(metrics.get("clf_prob"), patch) else dropped)[tile_id] = entry
+    return detections, dropped
+
+
+def collect_control_tiles(final: dict, dropped: Optional[dict] = None) -> dict:
+    """tile_id -> entry for every spot-check tile: a tile the scan does not report
+    and src/results.py::is_control_sample picks. Those are tiles the classifier
+    rejected whose input run_inference kept (is_control), and flagged tiles the
+    export rule dropped (`dropped`, from apply_export_rule). The proposed mask is
+    empty by definition. A tile that is also in `final` (a detection, e.g. after
+    a resumed job) is never a control."""
     controls = {}
     for csv_path in sorted(ORIG_DIR.glob("job_*/results.csv")):
         df = _read_results_csv(csv_path)
         if "is_control" not in df.columns:
             continue   # a run from before spot checks existed
+        nbr_encoding = _job_nbr_encoding(csv_path.parent)
         for _, row in df.iterrows():
             tile_id = row["tile_id"]
             if tile_id in final or not _is_true(row.get("is_control")) or not _nonempty(row.get("input_path")):
@@ -282,12 +329,22 @@ def collect_control_tiles(final: dict) -> dict:
             if not input_path.exists():
                 continue
             metrics = _metrics(row)
-            metrics["coverage"] = "0"
+            metrics["coverage"] = metrics["max_patch_px"] = "0"
             controls[tile_id] = {
                 "mask_path": None, "input_path": input_path, "prob_path": None,
                 "bbox": tuple(float(row[c]) for c in ("lon_min", "lat_min", "lon_max", "lat_max")),
                 "metrics": metrics, "source": "scan", "kind": "control",
+                "nbr_encoding": nbr_encoding,
             }
+    for tile_id, entry in (dropped or {}).items():
+        if tile_id in final or not entry["input_path"] or not entry["input_path"].exists():
+            continue
+        if not is_control_sample(tile_id, entry["metrics"].get("valid_frac")):
+            continue
+        controls[tile_id] = {
+            **entry, "mask_path": None, "prob_path": None, "kind": "control",
+            "metrics": dict(entry["metrics"], coverage="0", max_patch_px="0"),
+        }
     return controls
 
 
@@ -378,6 +435,8 @@ def export_index(results: dict, scan_id: str):
     results.csv — only `coverage` is recomputed from the mask when an older run
     didn't record it.
 
+    `nbr_encoding` says how the tile's NBR band is stored ("raw" -1..1, or the
+    old "rescaled" (NBR + 1) / 2, see config.NBR_ENCODING); absent = rescaled.
     `scan_id` is the last column (AUTOMATION_PLAN.md contract 4.2), the same
     value on every row — readers must tolerate its absence in an older index."""
     entries = _reviewable(results)
@@ -394,6 +453,7 @@ def export_index(results: dict, scan_id: str):
             **{col: metrics.get(col, "") for col in METRIC_COLUMNS},
             "source": r.get("source", ""),
             "kind": r.get("kind", "flagged"),
+            "nbr_encoding": r.get("nbr_encoding", "rescaled"),
             "scan_id": scan_id,
         })
 
@@ -486,16 +546,34 @@ def _model_block() -> dict:
     return {"classifier": classifier_block, "segmenter": segmenter_block}
 
 
-def write_scan_meta(scan_id: str, n_positive_tiles: int, n_control_tiles: int = 0) -> None:
+def _data_sources() -> list:
+    """Imagery source(s) the inference run used ("gee" / "pc"), from the
+    per-job run_meta.json files; runs from before the field existed were GEE."""
+    found = set()
+    for path in ORIG_DIR.glob("job_*/run_meta.json"):
+        try:
+            found.add(json.loads(path.read_text()).get("data_source") or "gee")
+        except (OSError, ValueError):
+            continue
+    return sorted(found)
+
+
+def write_scan_meta(scan_id: str, n_positive_tiles: int, n_control_tiles: int = 0,
+                    nbr_encodings: Optional[list] = None, n_flagged_tiles: Optional[int] = None) -> None:
     """Write scan_meta.json at the export root (contract 4.3): which pinned
-    models produced this scan_id, and how many positive tiles it carries, so a
-    downstream reader (training's manifest, a human comparing rounds) doesn't
-    have to reconstruct it from model_versions.json + run_meta.json by hand."""
+    models produced this scan_id, from which imagery source, and how many
+    positive tiles it carries, so a downstream reader (training's manifest, a
+    human comparing rounds) doesn't have to reconstruct it from
+    model_versions.json + run_meta.json by hand."""
     meta = {
         "scan_id": scan_id,
         "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         **_model_block(),
-        "n_positive_tiles": n_positive_tiles,
+        "data_source": _data_sources(),
+        "nbr_encoding": nbr_encodings or [],
+        "export_rule": {"min_clf_prob": EXPORT_MIN_CLF_PROB, "min_patch_px": EXPORT_MIN_PATCH_PX},
+        "n_flagged_tiles": n_flagged_tiles,    # flagged by the classifier
+        "n_positive_tiles": n_positive_tiles,  # of those, detections exported
         "n_control_tiles": n_control_tiles,
     }
     WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -554,6 +632,33 @@ def upload_to_hf(repo_id: str, args):
             print(f"  uploaded {path_in_repo}")
 
 
+def legacy_state_safe(repo_id: str) -> bool:
+    """Whether overwriting inputs/ and masks/ keeps every review traceable:
+    `scan-legacy` is tagged, or an earlier scan_id export already tagged its
+    round (the legacy state is then whatever it is — nothing left to save).
+    Prints what to do when it isn't, or when the tags can't be read."""
+    from huggingface_hub import HfApi
+    try:
+        tags = {t.name for t in HfApi().list_repo_refs(repo_id, repo_type="dataset").tags}
+    except Exception as exc:  # noqa: BLE001 — unknown is not safe
+        print(f"  !! could not read the tags of {repo_id}: {exc}")
+        return False
+    if LEGACY_SCAN_ID in tags:
+        return True
+    if any(SCAN_ID_RE.match(t) for t in tags):
+        print(f"  ! {repo_id} has no {LEGACY_SCAN_ID} tag, but earlier scan_id exports are tagged; "
+              "the pre-scan_id state is already gone, so there is nothing left to protect.")
+        return True
+    print(
+        f"  !! {repo_id} has no {LEGACY_SCAN_ID} tag. This export overwrites inputs/ and masks/, and\n"
+        "     the reviews made so far point at that tag for the imagery they judged. Tag it once:\n"
+        "       python -c \"from huggingface_hub import HfApi; HfApi().create_tag("
+        f"'{repo_id}', tag='{LEGACY_SCAN_ID}', repo_type='dataset', "
+        "tag_message='State reviewed before scan_id existed')\""
+    )
+    return False
+
+
 def tag_dataset(repo_id: str, scan_id: str):
     """Tag the dataset repo at the commit the export just uploaded, so
     `revision=scan_id` reproduces exactly what reviewers saw during this round
@@ -589,14 +694,22 @@ def print_upload_plan(args, scan_id: str):
 
 def main():
     args = parse_args()
+    if args.check_legacy_tag:
+        sys.exit(0 if legacy_state_safe(args.hf_repo) else 1)
+    if not args.dry_run and not args.allow_untagged_legacy and not legacy_state_safe(args.hf_repo):
+        sys.exit("refusing to export (see above), nothing was uploaded; "
+                 "--allow-untagged-legacy overrides")
     scan_id = args.scan_id
     print(f"scan_id: {scan_id}")
 
-    final_results = collect_final_results()
-    print(f"Final mask count (resegmented overrides original): {len(final_results)}")
+    flagged = collect_final_results()
+    final_results, dropped = apply_export_rule(flagged)
+    print(f"Flagged by the classifier (resegmented overrides original): {len(flagged)}")
+    print(f"Detections exported (clf_prob >= {EXPORT_MIN_CLF_PROB}, patch >= {EXPORT_MIN_PATCH_PX} px): "
+          f"{len(final_results)}; {len(dropped)} flagged tiles below the rule")
     mask_paths = [r["mask_path"] for r in final_results.values()]
-    controls = collect_control_tiles(final_results)
-    print(f"Spot-check tiles (rejected, sampled for review): {len(controls)}")
+    controls = collect_control_tiles(final_results, dropped)
+    print(f"Spot-check tiles (not reported, sampled for review): {len(controls)}")
     reviewable = {**final_results, **controls}   # the map and GeoJSON stay detections-only
 
     export_geojson(mask_paths)
@@ -611,7 +724,8 @@ def main():
     if args.include_probs:
         export_probs(final_results)
 
-    write_scan_meta(scan_id, len(final_results), len(controls))
+    write_scan_meta(scan_id, len(final_results), len(controls),
+                    sorted({r.get("nbr_encoding", "rescaled") for r in reviewable.values()}), len(flagged))
 
     if args.dry_run:
         print_upload_plan(args, scan_id)

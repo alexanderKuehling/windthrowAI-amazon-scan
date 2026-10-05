@@ -12,3 +12,5 @@ shapely>=2.0.0
 requests>=2.31.0
 opencv-python-headless>=4.8.0
 huggingface_hub>=0.24.0
+pystac-client>=0.7.0     # DATA_SOURCE="pc": Planetary Computer scene search (src/data_pc.py)
+planetary-computer>=1.0.0 # ... and its SAS-token signing of the scene files
