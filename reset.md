@@ -27,6 +27,7 @@ cd windthrowAI-amazon-scan
 ```bash
 rm -rf outputs outputs_resegment outputs_final
 rm -rf slurm_logs/*/* src/__pycache__ scripts/__pycache__   # empties the log folders, keeps them
+# just one failed attempt's logs instead: rm -rf slurm_logs/*/<run>   (run = the printed timestamp)
 ```
 
 `tile_grid.parquet` is deliberately kept: it is a deterministic function of the

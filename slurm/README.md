@@ -400,7 +400,7 @@ The optional re-segment step (99) is **not** part of this chain — it stays a
 manual, reviewed insertion between 02 and 03:
 
 ```bash
-# after 02, read the positive count from slurm_logs/merge/*.out
+# after 02, read the positive count from slurm_logs/merge/<run>/*.out
 sbatch --array=0-120%8 slurm/99_resegment_array_optional.sh
 sbatch --dependency=afterok:<reseg_jobid> slurm/03_export_frontend.sh
 ```
@@ -431,4 +431,8 @@ Both array jobs are per-task independent — a failed task can be resubmitted on
 its own with `--array=<idx>`, and completed tasks are safe to re-run (each
 rewrites its own `job_{idx:04d}/` directory).
 
-Logs land in `slurm_logs/`: `-%j` for single jobs, `-%A_%a` for array tasks.
+Logs: `run_full_scan.sh` and `resume_scan.sh` give every run its own folder per
+step, `slurm_logs/<step>/<run>/` (run = UTC timestamp, printed at submission):
+`<jobid>.out/.err` for single jobs, `<jobid>_<task>.out/.err` for the 116
+inference tasks. `rm -rf slurm_logs/*/<run>` deletes one attempt's logs.
+Jobs submitted by hand write to the plain `slurm_logs/<step>/` folders.

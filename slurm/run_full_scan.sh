@@ -29,10 +29,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# SLURM opens each job's --output/--error file before the job starts, so a
-# missing log folder (reset.md deletes slurm_logs/) fails the job at once with
-# no log at all. The mkdir inside the job scripts runs too late for that.
-mkdir -p slurm_logs/grid slurm_logs/infer slurm_logs/merge slurm_logs/export
+# Logs of this run go to slurm_logs/<step>/<RUN>/, so the 116 inference task
+# logs of one attempt sit in one folder: `rm -rf slurm_logs/*/<RUN>` clears it.
+# SLURM opens each job's --output/--error file before the job starts and does
+# not create folders, so they are made here and passed on the sbatch line
+# (the job ids aren't known before submission, hence the timestamp).
+RUN=$(date -u +%Y%m%dT%H%M%SZ)
+logdir() { mkdir -p "slurm_logs/$1/$RUN" && echo "slurm_logs/$1/$RUN"; }
 
 # Step 03 overwrites inputs/ and masks/ on HF. Reviews from before scan_id
 # existed are pinned to the `scan-legacy` tag, so refuse to start a scan whose
@@ -50,8 +53,10 @@ if [[ "$SOURCE" == "pc" ]] && ! python -c "import pystac_client, planetary_compu
     exit 1
 fi
 
+echo "Logs of this run: slurm_logs/*/$RUN/"
 echo "Submitting grid generation + model resolution (00), waiting..."
-if ! sbatch --wait slurm/00_generate_grid.sh; then
+G=$(logdir grid)
+if ! sbatch --wait --output="$G/%j.out" --error="$G/%j.err" slurm/00_generate_grid.sh; then
     echo "step 00 failed — aborting, nothing else submitted" >&2
     exit 1
 fi
@@ -67,14 +72,20 @@ print(n_jobs(GRID_FILE, TILES_PER_JOB) - 1)
 PAR=$(python -c "from src.sources import array_parallel; print(array_parallel())")
 echo "Array range: 0-$N (max $PAR running)"
 
-INFER_JOBID=$(sbatch --parsable --array=0-"$N"%"$PAR" slurm/01_inference_array.sh)
+L=$(logdir infer)
+INFER_JOBID=$(sbatch --parsable --array=0-"$N"%"$PAR" --output="$L/%A_%a.out" --error="$L/%A_%a.err" \
+    slurm/01_inference_array.sh)
 echo "inference   : $INFER_JOBID (array 0-$N%$PAR)"
 
-MERGE_JOBID=$(sbatch --parsable --dependency=afterok:"$INFER_JOBID" slurm/02_merge_results.sh)
+L=$(logdir merge)
+MERGE_JOBID=$(sbatch --parsable --dependency=afterok:"$INFER_JOBID" --output="$L/%j.out" --error="$L/%j.err" \
+    slurm/02_merge_results.sh)
 echo "merge       : $MERGE_JOBID"
 
-EXPORT_JOBID=$(sbatch --parsable --dependency=afterok:"$MERGE_JOBID" slurm/03_export_frontend.sh)
+L=$(logdir export)
+EXPORT_JOBID=$(sbatch --parsable --dependency=afterok:"$MERGE_JOBID" --output="$L/%j.out" --error="$L/%j.err" \
+    slurm/03_export_frontend.sh)
 echo "export      : $EXPORT_JOBID"
 
 echo
-echo "Full scan submitted. Monitor with: squeue -u \$USER"
+echo "Full scan submitted. Monitor with: squeue -u \$USER  — logs in slurm_logs/*/$RUN/"
