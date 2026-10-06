@@ -18,7 +18,9 @@
 
 mkdir -p slurm_logs
 
-module load cuda/12.1
+# Optional: the cluster no longer has this module, and PyTorch's wheels bring
+# their own CUDA runtime. Must not fail the task under `set -e`.
+module load cuda/12.1 2>/dev/null || echo "cuda/12.1 module not available, using PyTorch's bundled CUDA"
 ml proxy
 
 CONDA_BASE=$(conda info --base)
