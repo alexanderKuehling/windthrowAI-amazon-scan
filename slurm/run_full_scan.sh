@@ -29,6 +29,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# SLURM opens each job's --output/--error file before the job starts, so a
+# missing log folder (reset.md deletes slurm_logs/) fails the job at once with
+# no log at all. The mkdir inside the job scripts runs too late for that.
+mkdir -p slurm_logs/grid slurm_logs/infer slurm_logs/merge slurm_logs/export
+
 # Step 03 overwrites inputs/ and masks/ on HF. Reviews from before scan_id
 # existed are pinned to the `scan-legacy` tag, so refuse to start a scan whose
 # export would destroy what those reviewers saw (one-time tag: LOOP.md).

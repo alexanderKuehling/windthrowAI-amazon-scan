@@ -4,7 +4,10 @@ outputs_resegment/
 outputs_final/reviews/download/
 tile_grid.parquet
 model_versions.json
-slurm_logs/
+# log contents only: the folders are tracked (.gitkeep), SLURM needs them before a job starts
+slurm_logs/**
+!slurm_logs/**/
+!slurm_logs/**/.gitkeep
 models/*.pth
 gee-windthrowai-secret.json
 __pycache__/

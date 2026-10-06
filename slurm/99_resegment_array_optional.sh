@@ -6,8 +6,8 @@
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
 #SBATCH --job-name=WTAI_reseg
-#SBATCH --output=slurm_logs/reseg-%A/%a.out
-#SBATCH --error=slurm_logs/reseg-%A/%a.err
+#SBATCH --output=slurm_logs/reseg/%A_%a.out
+#SBATCH --error=slurm_logs/reseg/%A_%a.err
 #SBATCH --array=0-120%8     # adjust: ceil(num_positives / chunk_size) - 1; keep %8 on GEE (budget, see 01)
 #SBATCH --mail-type=FAIL
 

@@ -15,6 +15,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# SLURM opens each job's --output/--error file before the job starts, so a
+# missing log folder (reset.md deletes slurm_logs/) fails the job at once with
+# no log at all. The mkdir inside the job scripts runs too late for that.
+mkdir -p slurm_logs/infer slurm_logs/merge slurm_logs/export
+
 JOBS=$(python scripts/merge_results.py --list-incomplete)
 PAR=$(python -c "from src.sources import array_parallel; print(array_parallel())")
 
