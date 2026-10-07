@@ -32,6 +32,7 @@ task indexes that still have missing or failed tiles (used by resume_scan.sh).
 import argparse
 import csv
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -195,12 +196,14 @@ def main():
     abs_masks  = [str(ROOT / p) for p in mask_paths]
 
     if abs_masks:
+        # The VRT is a convenience for QGIS; nothing downstream reads it, so a
+        # node without GDAL's command-line tools skips it instead of failing.
         vrt_path = str(OUTPUTS_DIR / "windthrow_amazon.vrt")
-        subprocess.run(
-            ["gdalbuildvrt", "-resolution", "highest", vrt_path] + abs_masks,
-            check=True
-        )
-        print(f"VRT mosaic written → {vrt_path}")
+        if shutil.which("gdalbuildvrt"):
+            subprocess.run(["gdalbuildvrt", "-resolution", "highest", vrt_path] + abs_masks, check=True)
+            print(f"VRT mosaic written → {vrt_path}")
+        else:
+            print("  (gdalbuildvrt not on PATH — skipping the QGIS mosaic VRT)")
 
         # ── Vectorise masks to GeoJSON ───────────────────────────────────
         polys = []

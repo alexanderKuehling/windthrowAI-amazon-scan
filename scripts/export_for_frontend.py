@@ -54,7 +54,10 @@ export overwrites inputs/ and masks/ (`--allow-untagged-legacy` overrides).
 `--check-legacy-tag` runs only that check; slurm/run_full_scan.sh calls it
 before submitting anything.
 
-Requires on PATH: gdalbuildvrt, gdal2tiles.py (part of GDAL).
+Requires on PATH for the map overlay (step 3): gdalbuildvrt and gdal2tiles.py,
+GDAL's command-line tools — checked before anything else runs; slurm/03 finds
+them in a separate conda env `gdal` if windthrowEnv lacks them. --skip-tiles
+publishes without refreshing the map.
 Requires Python packages: rasterio, geopandas, shapely, huggingface_hub.
 Requires `huggingface-cli login` (or HF_TOKEN env var) with write access to
 the target dataset repo.
@@ -370,6 +373,11 @@ def export_geojson(mask_paths: list):
     print(f"  -> {GEOJSON_PATH}  ({len(gdf)} polygon(s))")
 
 
+def gdal2tiles_cmd() -> Optional[str]:
+    """GDAL's tiler under either of its install names, or None."""
+    return shutil.which("gdal2tiles.py") or shutil.which("gdal2tiles")
+
+
 def export_tiles(mask_paths: list, zoom: str):
     print(f"Building RGBA overlays for {len(mask_paths)} masks ...")
     RGBA_DIR.mkdir(parents=True, exist_ok=True)
@@ -400,7 +408,7 @@ def export_tiles(mask_paths: list, zoom: str):
     if TILES_DIR.exists():
         shutil.rmtree(TILES_DIR)
     subprocess.run(
-        ["gdal2tiles.py", "-p", "mercator", "-z", zoom, "-w", "none", "--xyz",
+        [gdal2tiles_cmd(), "-p", "mercator", "-z", zoom, "-w", "none", "--xyz",
          "-x", "--processes", str(os.cpu_count() or 4),
          str(VRT_PATH), str(TILES_DIR)],
         check=True,
@@ -699,6 +707,10 @@ def main():
     if not args.dry_run and not args.allow_untagged_legacy and not legacy_state_safe(args.hf_repo):
         sys.exit("refusing to export (see above), nothing was uploaded; "
                  "--allow-untagged-legacy overrides")
+    if not args.skip_tiles and not (shutil.which("gdalbuildvrt") and gdal2tiles_cmd()):
+        sys.exit("the map overlay needs GDAL's command-line tools (gdalbuildvrt, gdal2tiles.py), "
+                 "which are not on PATH. Once: `conda create -n gdal -c conda-forge gdal` "
+                 "(slurm/03 picks that env up). Or publish without refreshing the map: --skip-tiles")
     scan_id = args.scan_id
     print(f"scan_id: {scan_id}")
 

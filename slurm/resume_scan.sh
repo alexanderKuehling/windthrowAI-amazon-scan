@@ -6,9 +6,11 @@
 #     slurm/resume_scan.sh                   # redo unfinished tasks, then merge + export
 #     slurm/resume_scan.sh --accept-delta    # ... and accept a >50% positive-count change
 #     slurm/resume_scan.sh --allow-errors    # ... and publish without tiles that keep failing
+#     slurm/resume_scan.sh --skip-tiles      # ... and don't refresh the map overlay (export)
 #
-# Run from anywhere on the login node, windthrowEnv active. Flags are passed
-# to scripts/merge_results.py. A resubmitted task resumes from its results.csv
+# Run from anywhere on the login node, windthrowEnv active. --skip-tiles goes
+# to the export (scripts/export_for_frontend.py), every other flag to
+# scripts/merge_results.py. A resubmitted task resumes from its results.csv
 # (see reset.md), so finished tiles are never downloaded twice. When every task
 # is complete it submits just 02 -> 03.
 
@@ -22,6 +24,11 @@ cd "$(dirname "$0")/.."
 # (the job ids aren't known before submission, hence the timestamp).
 RUN=$(date -u +%Y%m%dT%H%M%SZ)
 logdir() { mkdir -p "slurm_logs/$1/$RUN" && echo "slurm_logs/$1/$RUN"; }
+
+MERGE_ARGS=(); EXPORT_ARGS=()
+for a in "$@"; do
+    if [[ "$a" == --skip-tiles ]]; then EXPORT_ARGS+=("$a"); else MERGE_ARGS+=("$a"); fi
+done
 
 JOBS=$(python scripts/merge_results.py --list-incomplete)
 PAR=$(python -c "from src.sources import array_parallel; print(array_parallel())")
@@ -39,11 +46,11 @@ fi
 
 L=$(logdir merge)
 MERGE_JOBID=$(sbatch --parsable ${DEP[@]+"${DEP[@]}"} --output="$L/%j.out" --error="$L/%j.err" \
-    slurm/02_merge_results.sh "$@")
-echo "merge       : $MERGE_JOBID ${*:-}"
+    slurm/02_merge_results.sh ${MERGE_ARGS[@]+"${MERGE_ARGS[@]}"})
+echo "merge       : $MERGE_JOBID ${MERGE_ARGS[*]:-}"
 
 L=$(logdir export)
 EXPORT_JOBID=$(sbatch --parsable --dependency=afterok:"$MERGE_JOBID" --output="$L/%j.out" --error="$L/%j.err" \
-    slurm/03_export_frontend.sh)
-echo "export      : $EXPORT_JOBID"
+    slurm/03_export_frontend.sh ${EXPORT_ARGS[@]+"${EXPORT_ARGS[@]}"})
+echo "export      : $EXPORT_JOBID ${EXPORT_ARGS[*]:-}"
 echo "logs        : slurm_logs/*/$RUN/"
