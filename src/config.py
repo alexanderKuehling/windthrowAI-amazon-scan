@@ -124,7 +124,13 @@ DATA_SOURCE = os.environ.get("WINDTHROW_DATA_SOURCE", "pc")
 # these needs no rescan: re-run 02 -> 03. Flagged tiles below the rule join
 # the spot-check pool like rejected ones (src/results.py::is_detection).
 EXPORT_MIN_CLF_PROB = CLASSIFIER_THRESHOLD
-EXPORT_MIN_PATCH_PX = 30
+EXPORT_MIN_PATCH_PX = int(os.environ.get("WINDTHROW_EXPORT_MIN_PATCH_PX", 30))   # env: per run, no file edit
+
+# Hugging Face rejects a commit that leaves more than this many files in one
+# folder. inputs/ and masks/ hold one file per published tile (detections +
+# spot checks), so the export refuses — before any upload — a round that
+# doesn't fit, and lists what other EXPORT_MIN_PATCH_PX values would give.
+HF_MAX_FILES_PER_DIR = 10_000
 
 # ── Spot-check sample ("control" tiles) ───────────────────────────────────
 # Reviewers otherwise only ever see tiles the scan reported, so its misses and

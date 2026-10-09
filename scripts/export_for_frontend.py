@@ -84,8 +84,8 @@ from shapely.geometry import shape
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.config import EXPORT_MIN_CLF_PROB, EXPORT_MIN_PATCH_PX, MODEL_VERSIONS_FILE
-from src.results import is_control_sample, is_detection, patch_px_of
+from src.config import EXPORT_MIN_CLF_PROB, EXPORT_MIN_PATCH_PX, HF_MAX_FILES_PER_DIR, MODEL_VERSIONS_FILE
+from src.results import is_control_sample, is_detection, passes_classifier, patch_px_of
 
 RESEG_DIR    = ROOT / "outputs_resegment"
 ORIG_DIR     = ROOT / "outputs"
@@ -311,6 +311,26 @@ def apply_export_rule(flagged: dict) -> tuple:
     return detections, dropped
 
 
+def check_folder_limit(flagged: dict, n_controls: int) -> None:
+    """Exit before anything is staged or uploaded when this round would put
+    more than HF_MAX_FILES_PER_DIR files into inputs/ or masks/ (one per
+    detection or spot check), with the counts other patch sizes would give."""
+    def detections(min_px: int) -> int:
+        return sum(1 for e in flagged.values()
+                   if passes_classifier(e["metrics"].get("clf_prob")) and int(e["metrics"]["max_patch_px"]) >= min_px)
+
+    n_detections = detections(EXPORT_MIN_PATCH_PX)
+    if n_detections + n_controls <= HF_MAX_FILES_PER_DIR:
+        return
+    print(f"\n  !! {n_detections:,} detections + {n_controls:,} spot checks = {n_detections + n_controls:,} files "
+          f"per folder; Hugging Face allows {HF_MAX_FILES_PER_DIR:,}. Detections at other EXPORT_MIN_PATCH_PX:")
+    for px in sorted({30, 40, 50, 75, 100, 150, 200, EXPORT_MIN_PATCH_PX}):
+        mark = "  <- current" if px == EXPORT_MIN_PATCH_PX else ""
+        print(f"       patch >= {px:3d} px ({px * 0.09:4.1f} ha): {detections(px):6,} detections{mark}")
+    sys.exit("export stopped, nothing uploaded. Pick a patch size that leaves room for the spot checks, "
+             "then: export WINDTHROW_EXPORT_MIN_PATCH_PX=<px> and submit again.")
+
+
 def collect_control_tiles(final: dict, dropped: Optional[dict] = None) -> dict:
     """tile_id -> entry for every spot-check tile: a tile the scan does not report
     and src/results.py::is_control_sample picks. Those are tiles the classifier
@@ -426,6 +446,7 @@ def export_inputs(results: dict):
     (uint16 web encoding, see encode_input_for_web)."""
     entries = _reviewable(results)
     print(f"Staging {len(entries)} input GeoTIFFs ...")
+    shutil.rmtree(INPUTS_DIR, ignore_errors=True)   # mirrored upload: only this round's files
     INPUTS_DIR.mkdir(parents=True, exist_ok=True)
     for tile_id, r in entries:
         encode_input_for_web(r["input_path"], INPUTS_DIR / f"{tile_id}.tif")
@@ -483,6 +504,7 @@ def export_probs(results: dict):
     publishing it lets a client re-threshold a detection without the GPU pass."""
     entries = [(tid, r) for tid, r in results.items() if r.get("prob_path") and r["prob_path"].exists()]
     print(f"Staging {len(entries)} probability maps ...")
+    shutil.rmtree(PROBS_DIR, ignore_errors=True)   # mirrored upload: only this round's files
     PROBS_DIR.mkdir(parents=True, exist_ok=True)
     for tile_id, r in entries:
         shutil.copyfile(r["prob_path"], PROBS_DIR / f"{tile_id}.tif")
@@ -499,6 +521,7 @@ def export_masks(results: dict):
         or (r.get("kind") == "control" and r["input_path"] and r["input_path"].exists())
     ]
     print(f"Staging {len(entries)} mask GeoTIFFs ...")
+    shutil.rmtree(MASKS_DIR, ignore_errors=True)   # mirrored upload: only this round's files
     MASKS_DIR.mkdir(parents=True, exist_ok=True)
     for tile_id, r in entries:
         if r["mask_path"]:
@@ -599,9 +622,11 @@ def write_scan_meta(scan_id: str, n_positive_tiles: int, n_control_tiles: int = 
 # folder no longer has are deleted in the same commit (scoped to that folder).
 # tiles/ needs it because gdal2tiles -x writes no tile where a scan found
 # nothing, so without it a detection the new model dropped would stay on the
-# map forever. inputs/ and masks/ don't: a tile missing from inputs_index.csv
-# is already invisible to reviewers.
-MIRRORED_FOLDERS = {"tiles"}
+# map forever. inputs/, masks/ and probs/ need it because Hugging Face allows
+# at most HF_MAX_FILES_PER_DIR files per folder: keeping every round's tiles
+# on main would hit that. Earlier rounds' files stay reachable at their
+# scan_id tags, which is where windthrowAI-training reads them from.
+MIRRORED_FOLDERS = {"tiles", "inputs", "masks", "probs"}
 
 
 def _upload_plan(args):
@@ -723,6 +748,7 @@ def main():
     controls = collect_control_tiles(final_results, dropped)
     print(f"Spot-check tiles (not reported, sampled for review): {len(controls)}")
     reviewable = {**final_results, **controls}   # the map and GeoJSON stay detections-only
+    check_folder_limit(flagged, len(controls))
 
     export_geojson(mask_paths)
     if not args.skip_tiles:

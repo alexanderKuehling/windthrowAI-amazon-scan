@@ -76,3 +76,16 @@ def test_export_publishes_detections_and_samples_dropped_tiles_as_spot_checks(tm
     assert set(controls) == {sampled}
     c = controls[sampled]
     assert c["kind"] == "control" and c["mask_path"] is None and c["metrics"]["max_patch_px"] == "0"
+
+
+def test_a_round_too_big_for_one_hf_folder_stops_before_any_upload(monkeypatch, capsys):
+    ex = pytest.importorskip("scripts.export_for_frontend")
+    monkeypatch.setattr(ex, "HF_MAX_FILES_PER_DIR", 3)
+    flagged = {f"t{i}": {"metrics": {"clf_prob": "0.9", "max_patch_px": str(px)}}
+               for i, px in enumerate((30, 40, 60, 120))}
+    with pytest.raises(SystemExit):
+        ex.check_folder_limit(flagged, n_controls=1)            # 4 detections + 1 spot check > 3
+    out = capsys.readouterr().out
+    assert "patch >=  50 px" in out and "patch >= 100 px (" in out
+    flagged.pop("t0"), flagged.pop("t1")
+    ex.check_folder_limit(flagged, n_controls=1)                # 2 + 1 fits: no exit

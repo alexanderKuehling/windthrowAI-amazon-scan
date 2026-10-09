@@ -61,18 +61,22 @@ def patch_px_of(row: dict, root: Path) -> int:
         return largest_patch_px(src.read(1) > 0)
 
 
+def passes_classifier(clf_prob) -> bool:
+    """The classifier half of the export rule (config.EXPORT_MIN_CLF_PROB). A row
+    from before clf_prob was recorded passed the classifier gate at the time."""
+    try:
+        return clf_prob in (None, "") or not float(clf_prob) < EXPORT_MIN_CLF_PROB
+    except (TypeError, ValueError):
+        return True
+
+
 def is_detection(clf_prob, max_patch_px: int) -> bool:
     """The export rule (config.EXPORT_MIN_CLF_PROB / EXPORT_MIN_PATCH_PX): a
     flagged tile counts as a detection — exported, reviewed, on the map — only
     with a windthrow-sized patch. Shared by merge_results.py (the positive count
     it guards) and export_for_frontend.py (what it publishes). A row from before
     clf_prob was recorded passed the classifier gate at the time."""
-    try:
-        if clf_prob not in (None, "") and float(clf_prob) < EXPORT_MIN_CLF_PROB:
-            return False
-    except (TypeError, ValueError):
-        pass
-    return max_patch_px >= EXPORT_MIN_PATCH_PX
+    return passes_classifier(clf_prob) and max_patch_px >= EXPORT_MIN_PATCH_PX
 
 
 def is_control_sample(tile_id: str, valid_frac) -> bool:
