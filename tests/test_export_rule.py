@@ -78,17 +78,19 @@ def test_export_publishes_detections_and_samples_dropped_tiles_as_spot_checks(tm
     assert c["kind"] == "control" and c["mask_path"] is None and c["metrics"]["max_patch_px"] == "0"
 
 
-def test_a_round_too_big_for_one_hf_folder_stops_before_any_upload(monkeypatch, capsys):
+def test_tile_files_go_into_one_subfolder_per_grid_row():
+    ex = pytest.importorskip("scripts.export_for_frontend")
+    assert ex.tile_file("inputs", "r0341_c0444") == "inputs/r0341/r0341_c0444.tif"
+    assert ex.tile_file("masks", "r0002_c0010") == "masks/r0002/r0002_c0010.tif"
+    assert len(ex.shard("odd-id")) == 2                          # hash fallback
+
+
+def test_layout_check_stops_only_when_a_subfolder_would_overflow(monkeypatch):
     ex = pytest.importorskip("scripts.export_for_frontend")
     monkeypatch.setattr(ex, "HF_MAX_FILES_PER_DIR", 3)
-    flagged = {f"t{i}": {"metrics": {"clf_prob": "0.9", "max_patch_px": str(px)}}
-               for i, px in enumerate((30, 40, 60, 120))}
+    ex.check_folder_layout([f"r0001_c{c:04d}" for c in range(3)] + ["r0002_c0000"])   # 3 + 1: fits
     with pytest.raises(SystemExit):
-        ex.check_folder_limit(flagged, n_controls=1)            # 4 detections + 1 spot check > 3
-    out = capsys.readouterr().out
-    assert "patch >=  50 px" in out and "patch >= 100 px (" in out
-    flagged.pop("t0"), flagged.pop("t1")
-    ex.check_folder_limit(flagged, n_controls=1)                # 2 + 1 fits: no exit
+        ex.check_folder_layout([f"r0001_c{c:04d}" for c in range(4)])                 # 4 in one row
 
 
 def test_stale_remote_files_are_deleted_in_their_own_commit_before_the_upload(tmp_path, monkeypatch):
@@ -118,3 +120,28 @@ def test_stale_remote_files_are_deleted_in_their_own_commit_before_the_upload(tm
     monkeypatch.setattr(ex, "_upload_plan", lambda args: plan)
     ex.upload_to_hf("repo", None)
     assert calls == [("delete", ["inputs/old.tif"]), ("upload", "inputs", None)]   # masks/ untouched, delete first
+
+
+def test_staged_files_and_index_use_the_row_layout(tmp_path, monkeypatch):
+    ex = pytest.importorskip("scripts.export_for_frontend")
+    job = tmp_path / "outputs" / "job_0000"
+    job.mkdir(parents=True)
+    ms = np.random.rand(7, 16, 16).astype("float32")
+    mask = np.zeros((16, 16), np.uint8)
+    mask[:8, :8] = 1
+    save_mask(mask, BBOX, job / "m.tif")
+    save_input(ms, BBOX, job / "i.tif")
+    entry = {"mask_path": job / "m.tif", "input_path": job / "i.tif", "prob_path": None, "bbox": BBOX,
+             "metrics": {"coverage": "25"}, "kind": "flagged", "source": "scan", "nbr_encoding": "raw"}
+    work = tmp_path / "final"
+    for name, value in (("WORK_DIR", work), ("INPUTS_DIR", work / "inputs"), ("MASKS_DIR", work / "masks"),
+                        ("INPUTS_INDEX_PATH", work / "inputs_index.csv")):
+        monkeypatch.setattr(ex, name, value)
+    results = {"r0341_c0444": entry}
+    ex.export_inputs(results)
+    ex.export_masks(results)
+    ex.export_index(results, "scan-20261009T000000Z")
+    assert (work / "inputs/r0341/r0341_c0444.tif").exists() and (work / "masks/r0341/r0341_c0444.tif").exists()
+    row = next(csv.DictReader(open(work / "inputs_index.csv")))
+    assert (row["input_file"], row["mask_file"]) == ("inputs/r0341/r0341_c0444.tif", "masks/r0341/r0341_c0444.tif")
+    assert list(row)[-1] == "scan_id"

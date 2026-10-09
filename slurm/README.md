@@ -228,16 +228,21 @@ dataset `alexKlg/windthrowAI-dataset-segmentation_results`:
 
 - `windthrow.geojson` — dissolved windthrow polygons (map vector layer)
 - `tiles/` — PNG tile pyramid, Web Mercator `z/x/y` (map raster overlay)
-- `inputs/` — per-tile 7-band model input, uint16 web encoding (Expert-Review tab)
+- `inputs/<row>/<tile_id>.tif` — per-tile 7-band model input, uint16 web encoding
+  (Expert-Review tab). One subfolder per grid row (`r0341/…`): Hugging Face allows
+  10,000 files per folder, a row holds a few hundred tiles. Rounds before 2026-10
+  are flat (`inputs/<tile_id>.tif`); `inputs/`, `masks/` and `probs/` hold only
+  the current round, earlier ones stay reachable at their `scan_id` tags.
 - `inputs_index.csv` — the tile list the Expert-Review tab reads: `tile_id` →
   bbox plus the per-tile scores from `results.csv` (`coverage`, `clf_prob`,
   `seg_mean_prob_in_mask`, `seg_max_prob`, `valid_frac`, `n_scenes`,
   `date_first`, `date_last`, `cloud_mean`, `source`, `kind`, `nbr_encoding`,
+  `input_file`, `mask_file` (the tile's repo paths),
   `scan_id`). `kind` is `flagged` for detections, `control` for spot-check
   tiles; `nbr_encoding` is `raw` (NBR in −1…1) or `rescaled` ((NBR + 1) / 2,
   every round before 2026-10) — see "NBR encoding" below
-- `masks/` — per-tile proposed mask (Expert-Review tab); all-zero for spot checks
-- `probs/` — per-tile segmenter probability map, only with `--include-probs`
+- `masks/<row>/<tile_id>.tif` — per-tile proposed mask (Expert-Review tab); all-zero for spot checks
+- `probs/<row>/<tile_id>.tif` — per-tile segmenter probability map, only with `--include-probs`
 - `scan_meta.json` — this export's `scan_id`, timestamp, pinned model
   provenance, imagery source and NBR encoding, positive-tile and spot-check
   counts (repo root)

@@ -22,9 +22,12 @@ Steps:
      Expert-Review tab can filter and prioritise tiles without fetching imagery.
      The last column is `scan_id` (see below).
   6. Stage each positive tile's proposed mask as a single-band uint8 GeoTIFF
-     (masks/{tile_id}.tif), aligned to inputs/{tile_id}.tif, for the Expert-Review tab.
+     (masks/<row>/{tile_id}.tif), aligned to inputs/<row>/{tile_id}.tif, for the Expert-Review
+     tab. Every tile file sits in a subfolder per grid row (tile_file): Hugging Face
+     allows 10,000 files per folder. inputs_index.csv names each path (input_file,
+     mask_file); readers fall back to the flat inputs/{tile_id}.tif of older rounds.
   7. Optionally (--include-probs) stage the segmenter probability maps as
-     probs/{tile_id}.tif (uint8, probability = DN/255).
+     probs/<row>/{tile_id}.tif (uint8, probability = DN/255).
   8. Write scan_meta.json (model provenance + tile counts for this export).
 
 Steps 4-6 also cover the spot-check tiles: a hash sample of the tiles the scan
@@ -66,6 +69,7 @@ the target dataset repo.
 import argparse
 import json
 import os
+import hashlib
 import re
 import shutil
 import subprocess
@@ -85,7 +89,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.config import EXPORT_MIN_CLF_PROB, EXPORT_MIN_PATCH_PX, HF_MAX_FILES_PER_DIR, MODEL_VERSIONS_FILE
-from src.results import is_control_sample, is_detection, passes_classifier, patch_px_of
+from src.results import is_control_sample, is_detection, patch_px_of
 
 RESEG_DIR    = ROOT / "outputs_resegment"
 ORIG_DIR     = ROOT / "outputs"
@@ -134,7 +138,7 @@ def parse_args():
                          "Expert-Review tab reads); it is cheap and is written even "
                          "with --skip-inputs")
     ap.add_argument("--include-probs", action="store_true",
-                    help="also publish probs/{tile_id}.tif, the segmenter probability maps")
+                    help="also publish probs/<row>/{tile_id}.tif, the segmenter probability maps")
     ap.add_argument("--no-tag", action="store_true",
                     help="skip tagging the HF dataset repo with scan_id after upload")
     ap.add_argument("--dry-run", action="store_true",
@@ -311,24 +315,33 @@ def apply_export_rule(flagged: dict) -> tuple:
     return detections, dropped
 
 
-def check_folder_limit(flagged: dict, n_controls: int) -> None:
-    """Exit before anything is staged or uploaded when this round would put
-    more than HF_MAX_FILES_PER_DIR files into inputs/ or masks/ (one per
-    detection or spot check), with the counts other patch sizes would give."""
-    def detections(min_px: int) -> int:
-        return sum(1 for e in flagged.values()
-                   if passes_classifier(e["metrics"].get("clf_prob")) and int(e["metrics"]["max_patch_px"]) >= min_px)
+def shard(tile_id: str) -> str:
+    """Subfolder a tile's files go into: its grid row, "r0341" for "r0341_c0444"
+    (src/tile_grid.py names tiles r<row>_c<col>). Hugging Face allows at most
+    HF_MAX_FILES_PER_DIR files per folder; a grid row holds a few hundred tiles
+    and the grid a few hundred rows, so neither level gets near it however many
+    tiles a round publishes. Any other id falls back to a hash prefix."""
+    head = tile_id.split("_", 1)[0]
+    return head if re.fullmatch(r"r\d+", head) else hashlib.md5(tile_id.encode()).hexdigest()[:2]
 
-    n_detections = detections(EXPORT_MIN_PATCH_PX)
-    if n_detections + n_controls <= HF_MAX_FILES_PER_DIR:
-        return
-    print(f"\n  !! {n_detections:,} detections + {n_controls:,} spot checks = {n_detections + n_controls:,} files "
-          f"per folder; Hugging Face allows {HF_MAX_FILES_PER_DIR:,}. Detections at other EXPORT_MIN_PATCH_PX:")
-    for px in sorted({30, 40, 50, 75, 100, 150, 200, EXPORT_MIN_PATCH_PX}):
-        mark = "  <- current" if px == EXPORT_MIN_PATCH_PX else ""
-        print(f"       patch >= {px:3d} px ({px * 0.09:4.1f} ha): {detections(px):6,} detections{mark}")
-    sys.exit("export stopped, nothing uploaded. Pick a patch size that leaves room for the spot checks, "
-             "then: export WINDTHROW_EXPORT_MIN_PATCH_PX=<px> and submit again.")
+
+def tile_file(folder: str, tile_id: str) -> str:
+    """Repo path of one tile's file, e.g. inputs/r0341/r0341_c0444.tif. Written
+    into inputs_index.csv (input_file, mask_file), which is where the review app
+    and windthrowAI-training look it up; rounds without those columns are flat."""
+    return f"{folder}/{shard(tile_id)}/{tile_id}.tif"
+
+
+def check_folder_layout(tile_ids) -> None:
+    """Exit before anything is staged or uploaded if a folder of this layout
+    would still hold more than HF_MAX_FILES_PER_DIR entries."""
+    per_shard: dict = {}
+    for tile_id in tile_ids:
+        per_shard[shard(tile_id)] = per_shard.get(shard(tile_id), 0) + 1
+    fullest = max(per_shard.values(), default=0)
+    if len(per_shard) > HF_MAX_FILES_PER_DIR or fullest > HF_MAX_FILES_PER_DIR:
+        sys.exit(f"export stopped, nothing uploaded: {len(per_shard):,} subfolders, the fullest with "
+                 f"{fullest:,} tiles; Hugging Face allows {HF_MAX_FILES_PER_DIR:,} per folder.")
 
 
 def collect_control_tiles(final: dict, dropped: Optional[dict] = None) -> dict:
@@ -442,14 +455,14 @@ def _reviewable(results: dict) -> list:
 
 
 def export_inputs(results: dict):
-    """Stage each positive tile's model-input GeoTIFF as inputs/{tile_id}.tif
-    (uint16 web encoding, see encode_input_for_web)."""
+    """Stage each positive tile's model-input GeoTIFF as inputs/<row>/{tile_id}.tif
+    (tile_file; uint16 web encoding, see encode_input_for_web)."""
     entries = _reviewable(results)
     print(f"Staging {len(entries)} input GeoTIFFs ...")
     shutil.rmtree(INPUTS_DIR, ignore_errors=True)   # mirrored upload: only this round's files
     INPUTS_DIR.mkdir(parents=True, exist_ok=True)
     for tile_id, r in entries:
-        encode_input_for_web(r["input_path"], INPUTS_DIR / f"{tile_id}.tif")
+        encode_input_for_web(r["input_path"], WORK_DIR / tile_file("inputs", tile_id))
     print(f"  -> {INPUTS_DIR}  ({len(entries)} file(s))")
 
 
@@ -483,6 +496,8 @@ def export_index(results: dict, scan_id: str):
             "source": r.get("source", ""),
             "kind": r.get("kind", "flagged"),
             "nbr_encoding": r.get("nbr_encoding", "rescaled"),
+            "input_file": tile_file("inputs", tile_id),
+            "mask_file": tile_file("masks", tile_id),
             "scan_id": scan_id,
         })
 
@@ -499,7 +514,7 @@ def export_index(results: dict, scan_id: str):
 
 
 def export_probs(results: dict):
-    """Stage each positive tile's segmenter probability map as probs/{tile_id}.tif
+    """Stage each positive tile's segmenter probability map as probs/<row>/{tile_id}.tif
     (uint8, probability = DN/255). Optional: the review UI does not need it, but
     publishing it lets a client re-threshold a detection without the GPU pass."""
     entries = [(tid, r) for tid, r in results.items() if r.get("prob_path") and r["prob_path"].exists()]
@@ -507,13 +522,15 @@ def export_probs(results: dict):
     shutil.rmtree(PROBS_DIR, ignore_errors=True)   # mirrored upload: only this round's files
     PROBS_DIR.mkdir(parents=True, exist_ok=True)
     for tile_id, r in entries:
-        shutil.copyfile(r["prob_path"], PROBS_DIR / f"{tile_id}.tif")
+        dest = WORK_DIR / tile_file("probs", tile_id)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(r["prob_path"], dest)
     print(f"  -> {PROBS_DIR}  ({len(entries)} file(s))")
 
 
 def export_masks(results: dict):
-    """Stage each positive tile's proposed mask as masks/{tile_id}.tif — a single-band
-    uint8 (0/1) GeoTIFF on the same grid as inputs/{tile_id}.tif, so the Expert-Review
+    """Stage each positive tile's proposed mask as masks/<row>/{tile_id}.tif — a single-band
+    uint8 (0/1) GeoTIFF on the same grid as the tile's input, so the Expert-Review
     tab can load a per-pixel-editable proposed mask that lines up with the input imagery."""
     entries = [
         (tid, r) for tid, r in results.items()
@@ -535,7 +552,9 @@ def export_masks(results: dict):
                 mask    = np.zeros((src.height, src.width), dtype="uint8")
                 profile = src.profile
         profile.update(count=1, dtype="uint8", nodata=None, compress="deflate")
-        with rasterio.open(MASKS_DIR / f"{tile_id}.tif", "w", **profile) as dst:
+        dest = WORK_DIR / tile_file("masks", tile_id)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(dest, "w", **profile) as dst:
             dst.write(mask, 1)
     print(f"  -> {MASKS_DIR}  ({len(entries)} file(s))")
 
@@ -772,7 +791,7 @@ def main():
     controls = collect_control_tiles(final_results, dropped)
     print(f"Spot-check tiles (not reported, sampled for review): {len(controls)}")
     reviewable = {**final_results, **controls}   # the map and GeoJSON stay detections-only
-    check_folder_limit(flagged, len(controls))
+    check_folder_layout(reviewable)
 
     export_geojson(mask_paths)
     if not args.skip_tiles:

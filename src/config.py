@@ -127,9 +127,9 @@ EXPORT_MIN_CLF_PROB = CLASSIFIER_THRESHOLD
 EXPORT_MIN_PATCH_PX = int(os.environ.get("WINDTHROW_EXPORT_MIN_PATCH_PX", 30))   # env: per run, no file edit
 
 # Hugging Face rejects a commit that leaves more than this many files in one
-# folder. inputs/ and masks/ hold one file per published tile (detections +
-# spot checks), so the export refuses — before any upload — a round that
-# doesn't fit, and lists what other EXPORT_MIN_PATCH_PX values would give.
+# folder. The export therefore files each tile under its grid row
+# (inputs/r0341/r0341_c0444.tif, see export_for_frontend.tile_file): a few
+# hundred tiles per row, a few hundred rows, however big a round gets.
 HF_MAX_FILES_PER_DIR = 10_000
 
 # ── Spot-check sample ("control" tiles) ───────────────────────────────────
