@@ -619,7 +619,10 @@ def write_scan_meta(scan_id: str, n_positive_tiles: int, n_control_tiles: int = 
 # otherwise a reviewer can briefly see a new tile with no image, or an old
 # mask under a refreshed index (F7 in AUTOMATION_PLAN.md).
 # Remote folders mirrored exactly, not just added to: remote files the local
-# folder no longer has are deleted in the same commit (scoped to that folder).
+# folder no longer has are deleted (scoped to that folder) in a commit right
+# before the upload, see delete_stale_remote. Reviewers can hit missing
+# images of the previous round until inputs_index.csv lands, so pause
+# reviewing during an export.
 # tiles/ needs it because gdal2tiles -x writes no tile where a scan found
 # nothing, so without it a detection the new model dropped would stay on the
 # map forever. inputs/, masks/ and probs/ need it because Hugging Face allows
@@ -644,6 +647,26 @@ def _upload_plan(args):
     ]
 
 
+def delete_stale_remote(api, repo_id: str, folder: Path, path_in_repo: str) -> int:
+    """Delete the remote files under path_in_repo/ that the local `folder` does
+    not have, in one commit, *before* that folder is uploaded. upload_folder's
+    own delete_patterns can't be relied on for this: recent huggingface_hub
+    versions upload a large folder in several commits, and unless the deletions
+    land first, an intermediate commit holds old + new files and Hugging Face
+    rejects it past HF_MAX_FILES_PER_DIR. Returns how many files were removed."""
+    from huggingface_hub import CommitOperationDelete
+
+    prefix = path_in_repo.strip("/") + "/"
+    local = {prefix + p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()}
+    stale = [f for f in api.list_repo_files(repo_id, repo_type="dataset")
+             if f.startswith(prefix) and f not in local]
+    if stale:
+        api.create_commit(repo_id=repo_id, repo_type="dataset",
+                          operations=[CommitOperationDelete(path_in_repo=f) for f in stale],
+                          commit_message=f"Remove {len(stale)} files of earlier rounds from {prefix}")
+    return len(stale)
+
+
 def upload_to_hf(repo_id: str, args):
     from huggingface_hub import HfApi
 
@@ -654,11 +677,12 @@ def upload_to_hf(repo_id: str, args):
         if not enabled or not path.exists():
             continue
         if is_folder:
-            mirrored = path_in_repo in MIRRORED_FOLDERS
+            if path_in_repo in MIRRORED_FOLDERS:
+                n = delete_stale_remote(api, repo_id, path, path_in_repo)
+                print(f"  removed {n} files of earlier rounds from {path_in_repo}/")
             api.upload_folder(folder_path=str(path), path_in_repo=path_in_repo,
-                               repo_id=repo_id, repo_type="dataset",
-                               delete_patterns="*" if mirrored else None)
-            print(f"  uploaded {path_in_repo}/" + (" (stale remote files removed)" if mirrored else ""))
+                               repo_id=repo_id, repo_type="dataset")
+            print(f"  uploaded {path_in_repo}/")
         else:
             api.upload_file(path_or_fileobj=str(path), path_in_repo=path_in_repo,
                              repo_id=repo_id, repo_type="dataset")

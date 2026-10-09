@@ -89,3 +89,32 @@ def test_a_round_too_big_for_one_hf_folder_stops_before_any_upload(monkeypatch, 
     assert "patch >=  50 px" in out and "patch >= 100 px (" in out
     flagged.pop("t0"), flagged.pop("t1")
     ex.check_folder_limit(flagged, n_controls=1)                # 2 + 1 fits: no exit
+
+
+def test_stale_remote_files_are_deleted_in_their_own_commit_before_the_upload(tmp_path, monkeypatch):
+    ex = pytest.importorskip("scripts.export_for_frontend")
+    staged = tmp_path / "inputs"
+    staged.mkdir()
+    for name in ("new.tif", "kept.tif"):
+        (staged / name).write_bytes(b"x")
+    calls = []
+
+    class FakeApi:
+        def list_repo_files(self, repo_id, repo_type):
+            return ["inputs/old.tif", "inputs/kept.tif", "masks/old.tif", "inputs_index.csv"]
+
+        def create_commit(self, repo_id, repo_type, operations, commit_message):
+            calls.append(("delete", sorted(op.path_in_repo for op in operations)))
+
+        def upload_folder(self, folder_path, path_in_repo, repo_id, repo_type, **kw):
+            calls.append(("upload", path_in_repo, kw.get("delete_patterns")))
+
+        def upload_file(self, **kw):
+            calls.append(("file", kw["path_in_repo"]))
+
+    import huggingface_hub
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    plan = [(staged, "inputs", True, True)]
+    monkeypatch.setattr(ex, "_upload_plan", lambda args: plan)
+    ex.upload_to_hf("repo", None)
+    assert calls == [("delete", ["inputs/old.tif"]), ("upload", "inputs", None)]   # masks/ untouched, delete first
