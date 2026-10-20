@@ -22,8 +22,8 @@ from .config import (
 
 class WindthrowClassifier(nn.Module):
     """
-    MobileNetV3-Small backbone + single linear head.
-    ~2.5 M params, ~0.11 ms @ 256 px  (torch.compiled, bs=64 on A100).
+    timm backbone + single linear head. The live checkpoint embeds
+    efficientnet_b0 (~4 M params); CLASSIFIER_BACKBONE is only the fallback.
     """
 
     def __init__(
