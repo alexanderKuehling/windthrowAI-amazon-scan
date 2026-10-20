@@ -25,12 +25,16 @@ the summary ends in a verdict:
   DIFFERS   anything else — read the per-tile table, and scan with
             WINDTHROW_DATA_SOURCE=gee until it is understood
 
-What to expect (measured 2026-10-05 on 20 live tiles): where both sources hold
-the same scenes, 99.4-99.98% of pixels are bit-identical — the files are the
-same USGS product, and the rest are nearest-neighbour picks at pixel edges. A
-tile differs as a whole only when its best GEE scene is missing from Planetary
-Computer, which then picks the next-best one: for Jun-Sep 2024 over the Amazon
-box PC lacks 101 of GEE's 2,059 Landsat-8 scenes (~5%, mostly single dates).
+RESULT (2026-10-05, --live 20, without --models; its CSV is not in the repo):
+  - 19 of 20 tiles are 99.4-99.98% bit-identical — the files are the same
+    USGS product, and the rest are nearest-neighbour picks at pixel edges.
+  - Scenes: for Jun-Sep 2024 over the Amazon box PC lacks 101 of GEE's 2,059
+    Landsat-8 scenes (~5%, mostly single dates).
+  - Verdict: MATCH by the rule above (19/20 = 95% of tiles >= 95% identical).
+    Classifier agreement (--models) has not been measured yet.
+
+A tile differs as a whole only when its best GEE scene is missing from
+Planetary Computer, which then picks the next-best one.
 """
 
 import argparse

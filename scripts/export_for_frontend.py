@@ -185,6 +185,7 @@ def _is_true(v) -> bool:
 
 
 def _nonempty(v) -> bool:
+    """ Robust non emptiness"""
     return v is not None and str(v).strip() != "" and str(v).strip().lower() != "nan"
 
 
